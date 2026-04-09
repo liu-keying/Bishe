@@ -1,0 +1,6 @@
+{
+  "a_url": "http://127.0.0.1:8000",
+  "c_url": "http://127.0.0.1:8002",
+  "extract_method": "append_marker",
+  "ttl_s": 600
+}

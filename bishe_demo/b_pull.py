@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from dataclasses import dataclass
 
@@ -10,7 +9,7 @@ from redis.asyncio import Redis
 
 from .common import OverlayEnvelope, make_hls_master_path, now_ms
 from .hls_facade import parse_master_playlist_variant_uri, parse_media_playlist_all_segment_uris
-from .stego import extract_trailer, extract_ts_private
+from .stego import extract_trailer
 
 
 @dataclass(frozen=True)
@@ -22,7 +21,7 @@ class BPullConfig:
     poll_interval_s: float
 
 
-def _envelope_from_get_response(r: httpx.Response, fallback_session: str) -> OverlayEnvelope:
+def _envelope_from_get_response(r: httpx.Response, fallback_session: str, a_base_url: str) -> OverlayEnvelope:
     body = r.content
     kind = (r.headers.get("X-Bishe-Kind") or "direct").strip()
     session_id = (r.headers.get("X-Session") or "").strip() or fallback_session
@@ -37,6 +36,7 @@ def _envelope_from_get_response(r: httpx.Response, fallback_session: str) -> Ove
     b_pull_ms = now_ms()
     base_meta: dict = {
         "c_url": c_url_hdr,
+        "a_url": a_base_url,
         "ua": ua,
         "a_recv_ms": a_recv_ms,
         "b_pull_ms": b_pull_ms,
@@ -70,28 +70,7 @@ def _envelope_from_get_response(r: httpx.Response, fallback_session: str) -> Ove
         )
 
     if kind == "control":
-        stego = (r.headers.get("X-Bishe-Stego") or "append_marker").strip()
-        if stego == "ts_private":
-            inner = extract_ts_private(body)
-        else:
-            inner = extract_trailer(body)
-        ctrl = json.loads(inner.decode("utf-8"))
-        c_url = str(ctrl.get("c_url") or c_url_hdr).strip()
-        extract = ctrl.get("extract") or {"method": "append_marker"}
-        meta = {
-            **base_meta,
-            "c_url": c_url,
-            "overlay_phase": "control",
-            "extract": extract if isinstance(extract, dict) else {"method": "append_marker"},
-        }
-        return OverlayEnvelope.pack(
-            session_id=session_id,
-            seq=seq,
-            payload=b"",
-            content_type="application/json",
-            meta=meta,
-            t0_ms=t0_ms,
-        )
+        raise ValueError("control frames are disabled")
 
     raw = extract_trailer(body)
     meta = {**base_meta, "c_url": c_url_hdr or base_meta.get("c_url", "")}
@@ -192,7 +171,7 @@ async def run_b_pull(
                         break
 
                     try:
-                        env = _envelope_from_get_response(rs, live_session[0])
+                        env = _envelope_from_get_response(rs, live_session[0], cfg.a_base_url)
                         await redis.rpush(cfg.queue_key, env.to_json_bytes())
                         env_seq = int(rs.headers.get("X-Seq") or "0")
                         hdr_sess = (rs.headers.get("X-Session") or "").strip() or live_session[0]

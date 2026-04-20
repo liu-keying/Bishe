@@ -47,9 +47,14 @@ def main() -> int:
     p.add_argument("--a-url", default="http://127.0.0.1:8000", help="A 根地址")
     p.add_argument("--c-url", default="", help="可选，查询参数 c=")
     p.add_argument(
+        "--chunk-bytes",
+        default="",
+        help="可选，查询参数 chunk_bytes=（>=1024）；调大可减少 A 对最后一段的字节分块",
+    )
+    p.add_argument(
         "--extract",
         default="",
-        help="可选 append_marker / ts_private；省略则与上次 /overlay/control 一致",
+        help="可选 append_marker",
     )
     args = p.parse_args()
 
@@ -75,6 +80,8 @@ def main() -> int:
     params: dict[str, str] = {}
     if args.c_url.strip():
         params["c"] = args.c_url.strip()
+    if str(args.chunk_bytes).strip():
+        params["chunk_bytes"] = str(args.chunk_bytes).strip()
     if args.extract.strip():
         params["extract"] = args.extract.strip()
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from dataclasses import dataclass
 
@@ -9,7 +8,7 @@ import httpx
 from redis.asyncio import Redis
 
 from .common import OverlayEnvelope, now_ms
-from .stego import extract_trailer, extract_ts_private
+from .stego import extract_trailer
 
 
 @dataclass(frozen=True)
@@ -20,16 +19,7 @@ class BWorkerConfig:
     blpop_timeout_s: int = 5
 
 
-CTRL_KEY_PREFIX = "bishe:overlay:ctrl:"
 ASM_PREFIX = "bishe:overlay:asm:"
-
-
-def _ctrl_key(session_id: str) -> str:
-    return f"{CTRL_KEY_PREFIX}{session_id}"
-
-
-def _asm_meta_key(session_id: str, group_id: str) -> str:
-    return f"{ASM_PREFIX}{session_id}:{group_id}:meta"
 
 
 def _asm_data_key(session_id: str, group_id: str) -> str:
@@ -46,23 +36,12 @@ async def forward_one(
     meta = env.meta or {}
     phase = str(meta.get("overlay_phase") or "").strip()
 
-    if phase == "control":
-        c_url = str(meta.get("c_url") or "").strip() or cfg.c_base_url
-        extract = meta.get("extract") or {"method": "append_marker"}
-        if not isinstance(extract, dict):
-            raise RuntimeError("control: meta.extract 必须是对象")
-        data = json.dumps({"c_url": c_url, "extract": extract}, ensure_ascii=False, separators=(",", ":"))
-        await redis.set(_ctrl_key(env.session_id), data.encode("utf-8"), ex=3600)
-        logging.info("已缓存隐匿控制信息 session=%s seq=%s", env.session_id, env.seq)
-        return False
-
     if phase == "media":
         chunk_total = int(meta.get("chunk_total") or 1)
         chunk_index = int(meta.get("chunk_index") or 0)
         media_group_id = str(meta.get("media_group_id") or "").strip()
         hls_total = int(meta.get("hls_total") or 1)
         hls_index = int(meta.get("hls_index") or 0)
-        meta_method = str(meta.get("extract_method") or meta.get("stego") or "").strip()
         meta_c_url = str(meta.get("c_url") or "").strip()
 
         if hls_total > 1 and hls_index < hls_total - 1:
@@ -78,35 +57,35 @@ async def forward_one(
             return False
 
         if chunk_total <= 1:
-            method = meta_method
             c_url = meta_c_url or cfg.c_base_url
-            if not method:
-                raw_ctrl = await redis.get(_ctrl_key(env.session_id))
-                if raw_ctrl is None:
-                    raise RuntimeError(
-                        "media 到达但缺少控制信息：请先发送 overlay_phase=control，或在 A 的响应头带 X-Bishe-Stego 并在 meta 里传递"
-                    )
-                ctrl = json.loads(raw_ctrl.decode("utf-8"))
-                method = str(((ctrl.get("extract") or {}).get("method")) or "append_marker")
-                c_url = str(ctrl.get("c_url") or "").strip() or c_url
             video = env.unpack_payload()
-            if method == "append_marker":
+            try:
                 payload = extract_trailer(video)
-            elif method == "ts_private":
-                payload = extract_ts_private(video)
-            else:
-                raise RuntimeError(f"不支持的拆解方式: {method}")
+            except ValueError as e:
+                a_url = str(meta.get("a_url") or "").strip()
+                if a_url:
+                    try:
+                        await client.post(
+                            f"{a_url.rstrip('/')}/overlay/error-notice",
+                            json={
+                                "session_id": env.session_id,
+                                "seq": env.seq,
+                                "reason": "extract_failed",
+                                "detail": str(e),
+                            },
+                            headers={"X-Overlay": "1"},
+                        )
+                    except Exception:
+                        logging.exception("通知 A error-notice 失败")
+                raise
             if not c_url:
                 raise RuntimeError("未配置目标 C：control 中 c_url 为空且未设置 b-worker --c-url")
-            # 兼容旧控制帧模式：若使用 ctrl_key 推导出来的 c_url/method，则消费掉该 control
-            if not meta_method:
-                await redis.delete(_ctrl_key(env.session_id))
 
             url = f"{c_url.rstrip('/')}/recv"
             headers = {
                 "Content-Type": "application/octet-stream",
                 "X-Overlay": "1",
-                "X-Overlay-Extract": method,
+                "X-Overlay-Extract": "append_marker",
                 "X-Session": env.session_id,
                 "X-Seq": str(env.seq),
                 "X-T0-MS": str(env.t0_ms),
@@ -120,25 +99,10 @@ async def forward_one(
         if not media_group_id:
             raise RuntimeError("多分片媒体缺少 meta.media_group_id")
         sid = env.session_id
-        mkey = _asm_meta_key(sid, media_group_id)
         dkey = _asm_data_key(sid, media_group_id)
         piece = env.unpack_payload()
 
         if chunk_index == 0:
-            # 优先使用数据面 meta（无 control 帧模式）；否则回退到旧 ctrl_key
-            if meta_method:
-                raw_meta = json.dumps(
-                    {"c_url": meta_c_url, "extract": {"method": meta_method}},
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                await redis.set(mkey, raw_meta, ex=7200)
-            else:
-                raw_ctrl = await redis.get(_ctrl_key(sid))
-                if raw_ctrl is None:
-                    raise RuntimeError("分片媒体首包到达但缺少 control（或 control 已被消费）")
-                await redis.set(mkey, raw_ctrl, ex=7200)
-                await redis.delete(_ctrl_key(sid))
             await redis.hset(dkey, mapping={str(chunk_index): piece})
             await redis.expire(dkey, 7200)
         else:
@@ -154,15 +118,9 @@ async def forward_one(
         )
         if n_parts < chunk_total:
             return False
-
-        raw_ctrl = await redis.get(mkey)
-        if raw_ctrl is None:
-            raise RuntimeError("分片组装缺少缓存的 control 元数据")
-        ctrl = json.loads(raw_ctrl.decode("utf-8"))
-        method = str((ctrl.get("extract") or {}).get("method") or "append_marker")
-        c_url = str(ctrl.get("c_url") or "").strip() or cfg.c_base_url
+        c_url = meta_c_url or cfg.c_base_url
         if not c_url:
-            raise RuntimeError("未配置目标 C：control 中 c_url 为空且未设置 b-worker --c-url")
+            raise RuntimeError("未配置目标 C：请在 A 的响应头带 X-C-URL 或启动 b-worker 时提供 --c-url")
 
         blobs: list[bytes] = []
         for i in range(chunk_total):
@@ -172,21 +130,34 @@ async def forward_one(
             blobs.append(b)
         video = b"".join(blobs)
 
-        if method == "append_marker":
+        try:
             payload = extract_trailer(video)
-        elif method == "ts_private":
-            payload = extract_ts_private(video)
-        else:
-            raise RuntimeError(f"不支持的拆解方式: {method}")
+        except ValueError as e:
+            a_url = str(meta.get("a_url") or "").strip()
+            if a_url:
+                try:
+                    await client.post(
+                        f"{a_url.rstrip('/')}/overlay/error-notice",
+                        json={
+                            "session_id": sid,
+                            "seq": env.seq,
+                            "reason": "extract_failed",
+                            "detail": str(e),
+                            "media_group_id": media_group_id,
+                        },
+                        headers={"X-Overlay": "1"},
+                    )
+                except Exception:
+                    logging.exception("通知 A error-notice 失败")
+            raise
 
         await redis.delete(dkey)
-        await redis.delete(mkey)
 
         url = f"{c_url.rstrip('/')}/recv"
         headers = {
             "Content-Type": "application/octet-stream",
             "X-Overlay": "1",
-            "X-Overlay-Extract": method,
+            "X-Overlay-Extract": "append_marker",
             "X-Session": sid,
             "X-Seq": str(env.seq),
             "X-T0-MS": str(env.t0_ms),

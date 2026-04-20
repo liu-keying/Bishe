@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import os
 import re
 import uuid
 from collections import deque
@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from aiohttp import web
 
 from .common import now_ms
-from .stego import SUPPORTED_STEGO_METHODS, embed_trailer, embed_ts_packets
+from .stego import SUPPORTED_STEGO_METHODS, embed_trailer
 
 
 # 188B 伪 TS 包（同步字节 0x47），作外层「类分片」填充
@@ -24,15 +24,13 @@ MEDIA_CHUNK_BYTES = 256 * 1024
 class PendingPullJob:
     seq: int
     t0_ms: int
-    kind: str  # direct | control | media
+    kind: str  # direct | media
     c_url: str
     ua: str
     a_recv_ms: int
     content_type: str
     """direct: 用户原始字节；media: 已 embed_trailer 的完整媒体字节"""
     blob: bytes
-    """control: JSON 内层（将再被外层 embed_trailer 或 embed_ts_packets 包一层）"""
-    control_inner: bytes | None = None
     extract_method: str = "append_marker"
     """入队时 A 的会话 ID；拉片 URL 须与该值一致，媒体出队后 A 会轮换到下一 session。"""
     emit_session: str = ""
@@ -64,13 +62,6 @@ def _segment_response(job: PendingPullJob, *, next_session: str | None = None) -
     if job.kind == "media":
         body = job.blob
         bishe_kind = "media"
-    elif job.kind == "control":
-        inner = job.control_inner or b"{}"
-        if em == "ts_private":
-            body = embed_ts_packets(inner)
-        else:
-            body = embed_trailer(_FAKE_TS_PACKET, inner)
-        bishe_kind = "control"
     else:
         body = embed_trailer(_FAKE_TS_PACKET, job.blob)
         bishe_kind = "direct"
@@ -150,8 +141,23 @@ async def handle_hls_playlist(request: web.Request) -> web.Response:
 
     q: deque[PendingPullJob] = app["pull_queue"]
     head = q[0] if q else None
+    # 若队首仍是旧 session，则对新 session 返回“空列表”而不是 404：
+    # b-pull 将继续轮询，直到该 session 的分片真正入队到队首。
     if head and url_sid != head.emit_session:
-        return web.Response(status=404)
+        lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            "#EXT-X-TARGETDURATION:6",
+        ]
+        text = "\n".join(lines) + "\n"
+        return web.Response(
+            status=200,
+            body=text.encode("utf-8"),
+            headers={
+                "Content-Type": "application/vnd.apple.mpegurl",
+                "Cache-Control": "no-cache",
+            },
+        )
     if not head and url_sid != app["session_id"]:
         return web.Response(status=404)
 
@@ -201,9 +207,14 @@ async def handle_hls_segment(request: web.Request) -> web.Response:
         last_chunk = job.chunk_total <= 1 or job.chunk_index == job.chunk_total - 1
         last_hls = job.hls_total <= 1 or job.hls_index == job.hls_total - 1
         if last_chunk and last_hls:
-            app["session_seq"] = int(app["session_seq"]) + 1
-            app["session_id"] = f"bishe-{app['session_seq']}"
-            next_session = app["session_id"]
+            # session 的轮换由 /overlay/embed* 在入队时完成；这里仅把“该 session 的下一跳”告知拉片端。
+            # 注意：全局 session_id 可能已被并发入队推进到更大值，不能直接拿它当 next。
+            next_map: dict[str, str] = app.get("session_next") or {}
+            next_session = next_map.get(job.emit_session) or ""
+            if next_session:
+                # 已完成该 session 的最后一片，next 映射可释放
+                next_map.pop(job.emit_session, None)
+                app["session_next"] = next_map
 
     return _segment_response(job, next_session=next_session)
 
@@ -213,75 +224,46 @@ def _enqueue(app: web.Application, job: PendingPullJob) -> None:
     q.append(job)
 
 
-# POST /proxy（direct）已关闭：隐匿数据仅通过 /overlay/control + /overlay/embed（视频载体）。
-
-
-async def handle_overlay_control(request: web.Request) -> web.Response:
-    session_id: str = request.app["session_id"]
-    seq: int = request.app["seq"]
-    request.app["seq"] = seq + 1
-
-    body = await request.read()
-    try:
-        obj = json.loads(body.decode("utf-8") if body else "{}")
-    except Exception as e:
-        raw_preview = body[:200].decode("utf-8", errors="replace")
-        return web.json_response(
-            {"ok": False, "error": f"invalid json: {e!r}", "raw_preview": raw_preview},
-            status=400,
-        )
-
-    c_url = (
-        str(obj.get("c_url") or "").strip()
-        or (request.query.get("c") or "").strip()
-        or (request.headers.get("X-C-URL", "").strip())
-    )
-    extract = obj.get("extract") or {"method": "append_marker"}
-    if not isinstance(extract, dict):
-        return web.json_response({"ok": False, "error": "extract must be an object"}, status=400)
-    method = str(extract.get("method") or "append_marker").strip()
-    if method not in SUPPORTED_STEGO_METHODS:
-        return web.json_response(
-            {
-                "ok": False,
-                "error": f"unsupported extract.method: {method} (supported: {sorted(SUPPORTED_STEGO_METHODS)})",
-            },
-            status=400,
-        )
-
-    inner = json.dumps(
-        {"c_url": c_url, "extract": {"method": method}},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    job = PendingPullJob(
-        seq=seq,
-        t0_ms=now_ms(),
-        kind="control",
-        c_url=c_url,
-        ua=request.headers.get("User-Agent", ""),
-        a_recv_ms=now_ms(),
-        content_type="application/json",
-        blob=b"",
-        control_inner=inner,
-        extract_method=method,
-        emit_session=request.app["session_id"],
-    )
-    _enqueue(request.app, job)
-    # 下一条 /overlay/embed 若未带 extract 查询参数，自动与同一次实验的 control 对齐，避免 ts_private / append_marker 混用
-    request.app["pending_media_extract"] = method
-
-    return web.json_response(
-        {
-            "ok": True,
-            "queued_for_pull": True,
-            "session_id": session_id,
-            "seq": seq,
-            "phase": "control",
-            "c_url": c_url,
-            "extract": {"method": method},
+def _remember_for_retry(app: web.Application, job: PendingPullJob) -> None:
+    """
+    记录最近一次 media（用于 B 校验失败后请求 A 重传）。
+    只做最小实现：覆盖式保存最后一组，避免无限增长占内存。
+    """
+    if job.kind == "media":
+        # 兼容两种回调定位方式：
+        # - 按 emit_session 精确重传（推荐，避免并发/多组时重传错组）
+        # - 回退到“最近一次”重传（历史行为）
+        by_sess = app.get("retry_media_by_session")
+        if not isinstance(by_sess, dict):
+            by_sess = {}
+        emit_sess = (job.emit_session or "").strip()
+        if emit_sess not in by_sess or not isinstance(by_sess.get(emit_sess), list):
+            by_sess[emit_sess] = []
+        entry = {
+            "c_url": job.c_url,
+            "extract_method": job.extract_method,
+            "content_type": job.content_type,
+            "blob": job.blob,
+            "hls_index": job.hls_index,
+            "hls_total": job.hls_total,
+            "chunk_index": job.chunk_index,
+            "chunk_total": job.chunk_total,
+            "media_group_id": job.media_group_id,
         }
-    )
+        by_sess[emit_sess].append(entry)
+        app["retry_media_by_session"] = by_sess
+
+        # 保留旧字段：总是指向“最近一次追加的 media”
+        app["retry_media"] = by_sess[emit_sess]
+        return
+
+
+def _clear_retry_state(app: web.Application) -> None:
+    app["retry_media"] = []
+    app["retry_media_by_session"] = {}
+
+
+# POST /proxy（direct）已关闭：隐匿数据仅通过 /overlay/embed / /overlay/embed-hls（视频载体）。
 
 
 async def handle_overlay_embed(request: web.Request) -> web.Response:
@@ -289,11 +271,7 @@ async def handle_overlay_embed(request: web.Request) -> web.Response:
         session_id: str = request.app["session_id"]
 
         c_url = (request.query.get("c") or "").strip() or (request.headers.get("X-C-URL", "").strip())
-        q_extract = (request.query.get("extract") or request.query.get("e") or "").strip()
-        if q_extract:
-            extract_method = q_extract
-        else:
-            extract_method = (request.app.get("pending_media_extract") or "append_marker").strip()
+        extract_method = (request.query.get("extract") or request.query.get("e") or "").strip() or "append_marker"
         if extract_method not in SUPPORTED_STEGO_METHODS:
             return web.json_response(
                 {
@@ -328,10 +306,7 @@ async def handle_overlay_embed(request: web.Request) -> web.Response:
             return web.json_response({"ok": False, "error": "missing multipart field hidden"}, status=400)
 
         try:
-            if extract_method == "ts_private":
-                embedded = video + embed_ts_packets(hidden)
-            else:
-                embedded = embed_trailer(video, hidden)
+            embedded = embed_trailer(video, hidden)
         except Exception as e:
             return web.json_response({"ok": False, "error": f"embed failed: {e!r}"}, status=400)
 
@@ -356,7 +331,6 @@ async def handle_overlay_embed(request: web.Request) -> web.Response:
                 a_recv_ms=recv_ms,
                 content_type="video/mp4",
                 blob=embedded,
-                control_inner=None,
                 extract_method=extract_method,
                 emit_session=emit_sess,
                 media_group_id="",
@@ -364,6 +338,8 @@ async def handle_overlay_embed(request: web.Request) -> web.Response:
                 chunk_total=1,
             )
             _enqueue(request.app, job)
+            _clear_retry_state(request.app)
+            _remember_for_retry(request.app, job)
             media_chunks = 1
             first_seq = last_seq = seq
             group_id: str | None = None
@@ -372,6 +348,7 @@ async def handle_overlay_embed(request: web.Request) -> web.Response:
             chunks = [embedded[i : i + chunk_sz] for i in range(0, len(embedded), chunk_sz)]
             n = len(chunks)
             first_seq = request.app["seq"]
+            _clear_retry_state(request.app)
             for i, blob in enumerate(chunks):
                 seq = request.app["seq"]
                 request.app["seq"] = seq + 1
@@ -384,7 +361,6 @@ async def handle_overlay_embed(request: web.Request) -> web.Response:
                     a_recv_ms=recv_ms,
                     content_type="video/mp4",
                     blob=blob,
-                    control_inner=None,
                     extract_method=extract_method,
                     emit_session=emit_sess,
                     media_group_id=gid,
@@ -392,11 +368,19 @@ async def handle_overlay_embed(request: web.Request) -> web.Response:
                     chunk_total=n,
                 )
                 _enqueue(request.app, job)
+                _remember_for_retry(request.app, job)
             last_seq = request.app["seq"] - 1
             media_chunks = n
             group_id = gid
 
-        request.app["pending_media_extract"] = None
+        # 一组媒体入队完成后，轮换到下一 session，避免并发提交导致多组共享同一 emit_session。
+        # 同时记录 emit_sess -> next_sess 映射，供最后一片通过 X-Next-Session 引导 b-pull 顺序跟随。
+        request.app["session_seq"] = int(request.app["session_seq"]) + 1
+        next_sess = f"bishe-{request.app['session_seq']}"
+        next_map: dict[str, str] = request.app.get("session_next") or {}
+        next_map[str(emit_sess)] = next_sess
+        request.app["session_next"] = next_map
+        request.app["session_id"] = next_sess
 
         body_out: dict = {
             "ok": True,
@@ -431,11 +415,7 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
         session_id: str = request.app["session_id"]
 
         c_url = (request.query.get("c") or "").strip() or (request.headers.get("X-C-URL", "").strip())
-        q_extract = (request.query.get("extract") or request.query.get("e") or "").strip()
-        if q_extract:
-            extract_method = q_extract
-        else:
-            extract_method = (request.app.get("pending_media_extract") or "append_marker").strip()
+        extract_method = (request.query.get("extract") or request.query.get("e") or "").strip() or "append_marker"
         if extract_method not in SUPPORTED_STEGO_METHODS:
             return web.json_response(
                 {
@@ -477,10 +457,8 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
         ua = request.headers.get("User-Agent", "")
         recv_ms = now_ms()
         emit_sess = request.app["session_id"]
-        chunk_sz = MEDIA_CHUNK_BYTES
-        q_chunk = (request.query.get("chunk_bytes") or "").strip()
-        if q_chunk.isdigit() and int(q_chunk) >= 1024:
-            chunk_sz = min(int(q_chunk), 16 * 1024 * 1024)
+        # HLS overlay：chunk_sz 以第一个分片长度为准（用于最后一片加 hidden 后的再切分）
+        chunk_sz = len(segment_parts[0]) or MEDIA_CHUNK_BYTES
 
         first_seq = request.app["seq"]
         group_id: str | None = None
@@ -499,7 +477,6 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
                 a_recv_ms=recv_ms,
                 content_type="video/mp2t",
                 blob=segment_parts[i],
-                control_inner=None,
                 extract_method=extract_method,
                 emit_session=emit_sess,
                 media_group_id="",
@@ -512,13 +489,11 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
 
         last_raw = segment_parts[-1]
         try:
-            if extract_method == "ts_private":
-                embedded_last = last_raw + embed_ts_packets(hidden)
-            else:
-                embedded_last = embed_trailer(last_raw, hidden)
+            embedded_last = embed_trailer(last_raw, hidden)
         except Exception as e:
             return web.json_response({"ok": False, "error": f"embed failed: {e!r}"}, status=400)
 
+        _clear_retry_state(request.app)
         if len(embedded_last) <= chunk_sz:
             seq = request.app["seq"]
             request.app["seq"] = seq + 1
@@ -532,7 +507,6 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
                 a_recv_ms=recv_ms,
                 content_type="video/mp2t",
                 blob=embedded_last,
-                control_inner=None,
                 extract_method=extract_method,
                 emit_session=emit_sess,
                 media_group_id="",
@@ -542,6 +516,7 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
                 hls_total=n,
             )
             _enqueue(request.app, job)
+            _remember_for_retry(request.app, job)
             media_chunks = 1
         else:
             gid = uuid.uuid4().hex
@@ -549,6 +524,9 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
             chunks = [embedded_last[i : i + chunk_sz] for i in range(0, len(embedded_last), chunk_sz)]
             nc = len(chunks)
             for ci, blob in enumerate(chunks):
+                # 最后一块若不足 chunk_sz，用随机字节补足到固定长度
+                if len(blob) < chunk_sz:
+                    blob = blob + os.urandom(chunk_sz - len(blob))
                 seq = request.app["seq"]
                 request.app["seq"] = seq + 1
                 last_seq = seq
@@ -561,7 +539,6 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
                     a_recv_ms=recv_ms,
                     content_type="video/mp2t",
                     blob=blob,
-                    control_inner=None,
                     extract_method=extract_method,
                     emit_session=emit_sess,
                     media_group_id=gid,
@@ -571,9 +548,17 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
                     hls_total=n,
                 )
                 _enqueue(request.app, job)
+                _remember_for_retry(request.app, job)
             media_chunks = nc
 
-        request.app["pending_media_extract"] = None
+        # 一组 HLS 媒体入队完成后，轮换到下一 session，避免并发提交导致多组共享同一 emit_session。
+        # 同时记录 emit_sess -> next_sess 映射，供最后一片通过 X-Next-Session 引导 b-pull 顺序跟随。
+        request.app["session_seq"] = int(request.app["session_seq"]) + 1
+        next_sess = f"bishe-{request.app['session_seq']}"
+        next_map: dict[str, str] = request.app.get("session_next") or {}
+        next_map[str(emit_sess)] = next_sess
+        request.app["session_next"] = next_map
+        request.app["session_id"] = next_sess
 
         body_out: dict = {
             "ok": True,
@@ -612,6 +597,77 @@ async def handle_stop_notice(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def handle_error_notice(request: web.Request) -> web.Response:
+    """
+    B 校验/拆解失败的回调：A 收到后将最近一次 media 重新入队，供 B 重新拉取。
+    最小实现：重发“上一组”，并发送到当前 session（由 A 的轮换机制决定下一次拉取的会话）。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    logging.warning("A 收到 error-notice: %s", body)
+
+    # 优先按 B 提供的 session_id 精确定位那一组 media，避免并发/多组时重传错组。
+    sid = str(body.get("session_id") or body.get("emit_session") or body.get("X-Session") or "").strip()
+    by_sess = request.app.get("retry_media_by_session") or {}
+    media: list[dict] = []
+    if sid and isinstance(by_sess, dict):
+        m0 = by_sess.get(sid)
+        if isinstance(m0, list):
+            media = m0
+
+    # 回退：保持旧行为（重传最近一次）
+    if not media:
+        m1 = request.app.get("retry_media") or []
+        if isinstance(m1, list):
+            media = m1
+
+    if not media:
+        return web.json_response({"ok": False, "error": "no retry state"}, status=404)
+
+    t0_ms = now_ms()
+    recv_ms = now_ms()
+    ua = "retry"
+    emit_sess = request.app["session_id"]
+    first_seq = request.app["seq"]
+    last_seq = first_seq - 1
+
+    # 重发 media（按记录的顺序）
+    for m in media:
+        seq = request.app["seq"]
+        request.app["seq"] = seq + 1
+        last_seq = seq
+        job_media = PendingPullJob(
+            seq=seq,
+            t0_ms=t0_ms,
+            kind="media",
+            c_url=str(m.get("c_url") or ""),
+            ua=ua,
+            a_recv_ms=recv_ms,
+            content_type=str(m.get("content_type") or "application/octet-stream"),
+            blob=m.get("blob") or b"",
+            extract_method=str(m.get("extract_method") or "append_marker"),
+            emit_session=emit_sess,
+            media_group_id=str(m.get("media_group_id") or ""),
+            chunk_index=int(m.get("chunk_index") or 0),
+            chunk_total=int(m.get("chunk_total") or 1),
+            hls_index=int(m.get("hls_index") or 0),
+            hls_total=int(m.get("hls_total") or 1),
+        )
+        _enqueue(request.app, job_media)
+
+    return web.json_response(
+        {
+            "ok": True,
+            "requeued": True,
+            "session_id": emit_sess,
+            "seq_from": first_seq,
+            "seq_to": last_seq,
+        }
+    )
+
+
 async def run_a_proxy(*, host: str, port: int, session_id: str | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -620,14 +676,15 @@ async def run_a_proxy(*, host: str, port: int, session_id: str | None = None) ->
     seq0 = parse_initial_session_seq(session_id)
     app["session_seq"] = seq0
     app["session_id"] = f"bishe-{seq0}"
+    app["session_next"] = {}
     app["seq"] = 1
     app["pull_queue"] = deque[PendingPullJob]()
-    app["pending_media_extract"] = None
+    app["retry_media"] = []
 
     app.router.add_get("/health", handle_health)
     app.router.add_post("/overlay/stop-notice", handle_stop_notice)
+    app.router.add_post("/overlay/error-notice", handle_error_notice)
     # app.router.add_post("/proxy", handle_proxy)  # direct 已禁用，见文件内说明
-    app.router.add_post("/overlay/control", handle_overlay_control)
     app.router.add_post("/overlay/embed", handle_overlay_embed)
     app.router.add_post("/overlay/embed-hls", handle_overlay_embed_hls)
     app.router.add_get("/hls/{session_id}/master.m3u8", handle_hls_master)

@@ -2,7 +2,7 @@
 
 链路：**B 像播放器一样走 HLS 形态** — `GET master.m3u8` → `GET index.m3u8` → `GET seg-xxxxxx.ts`（分片为类 TS 二进制 + 业务头）→ **Redis** → **B-worker** → **HTTP/HTTPS** → **C**。
 
-- **A（本地源站）**：**`POST /proxy` 已关闭**；请用 **`POST /overlay/embed`**（multipart：`video` + `hidden`）将隐匿数据附在视频字节后入队。对外仍提供 **`master.m3u8` → `index.m3u8` → `seg-*.ts`**。
+- **A（本地源站）**：**`POST /proxy` 已关闭**；请用 **`POST /overlay/embed-hls`**（multipart：多个 `segment` + `hidden`）将隐匿数据附在 **最后一段 TS** 字节后入队。对外仍提供 **`master.m3u8` → `index.m3u8` → `seg-*.ts`**。
 - **B**：
   - `b-pull`：解析 m3u8 文本得到 URI，**按 HLS 习惯拉列表再拉分片**，拼 `OverlayEnvelope` 后写入 Redis。
   - `b-worker`：从 Redis 取出并 **POST** 到 C（`--c-url` 可为 `https://...`，默认校验证书关闭便于自签）。
@@ -49,30 +49,27 @@ python main.py b-worker --redis redis://127.0.0.1:6379/0 --queue bishe:overlay:q
 python main.py a --host 127.0.0.1 --port 8000 --session bishe-1
 ```
 
-## 发送隐匿数据（视频载体）
+## 发送隐匿数据（TS 分片载体）
 
-### 媒体帧（`video` / `hidden` 换成你的真实路径）
+### 多段 TS（`segment` 可重复字段，`hidden` 一份）
 
 ```powershell
 cd D:\PyProjects\Bishe
-curl.exe -X POST "http://127.0.0.1:8000/overlay/embed?c=http://127.0.0.1:8002" -F "video=@cover.mp4" -F "hidden=@hidden.bin"
+curl.exe -X POST "http://127.0.0.1:8000/overlay/embed-hls?c=http://127.0.0.1:8002" `
+  -F "segment=@.\out\hls_seg000.ts" `
+  -F "segment=@.\out\hls_seg001.ts" `
+  -F "hidden=@hidden.bin"
 ```
 
-若文件不在当前目录，写绝对路径，例如 `-F "video=@D:\PyProjects\Bishe\cover.mp4"`。
+若文件不在当前目录，写绝对路径。
 
-说明：`hidden` 经 **尾部 MAGIC+长度+SHA256(hidden)** 附在 `video` 字节之后；B 拉片后由 worker **`extract_trailer`** 校验 SHA256 并拆出再 **POST** 到 C。
+说明：`hidden`（若启用 E 下发的 PSK，则会先被 **AEAD 加密**）再经 **尾部 MAGIC+长度** 附在 **最后一段 TS** 字节之后；B 拉片后由 worker **`extract_trailer`** 拆出并 **POST** 到 C，C 再用 PSK **AEAD 解密**得到原始 `hidden`。
+
+可选（实验）：`?k=3` 将 **整段 AEAD 密文**均分为 3 份，随机选择 3 个 TS 分片分别嵌入；`?pad_bytes=188` 可在未携带密文的分片末尾追加固定长度伪 TS 填充（默认 0）。当 `k>1` 时，**B-worker** 用 Redis（`BISHE_REDIS`，与拉队相同）按 `cipher_group` 收齐分片、**拼接成整段密文**后再 POST 给 C；C 只做 **一次** AEAD 解密。
 
 ## 压测（端到端：A -> B -> C）
 
 先确保 C / B / A 都已启动，然后执行：
-
-```powershell
-cd D:\PyProjects\Bishe
-# 不需要 cover.mp4：默认自动生成 1MiB 随机载体（可用 --cover-bytes 调整）
-python .\scripts\bench_overlay_embed.py --a-url http://127.0.0.1:8000 --c-url http://127.0.0.1:8002 --concurrency 5 --duration-s 10 --hidden-bytes 4096
-```
-
-### 若你的载体是切好的 HLS `.ts` 分片
 
 ```powershell
 cd D:\PyProjects\Bishe

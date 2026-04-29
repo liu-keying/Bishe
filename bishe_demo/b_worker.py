@@ -8,7 +8,7 @@ import httpx
 from redis.asyncio import Redis
 
 from .common import OverlayEnvelope, now_ms
-from .stego import extract_trailer
+from .stego import STEGO_METHOD_PSK_HMAC_INPLACE, extract_psk_inplace, extract_trailer
 
 
 @dataclass(frozen=True)
@@ -17,13 +17,49 @@ class BWorkerConfig:
     queue_key: str
     c_base_url: str
     blpop_timeout_s: int = 5
+    psk: bytes | None = None
+    link_token: str = ""
 
 
 ASM_PREFIX = "bishe:overlay:asm:"
 
+# 方案 B：密文分片在 B 侧拼成整包 AEAD 后再 POST 给 C（C 只做单次 decrypt）
+CIPHER_B_ASM_PREFIX = "bishe:cipher_b_asm:"
+
+_cipher_asm_lock = asyncio.Lock()
+
+
+def _extract_stego_payload(*, video: bytes, meta: dict, cfg: BWorkerConfig) -> bytes:
+    em = str(meta.get("extract_method") or STEGO_METHOD_PSK_HMAC_INPLACE).strip()
+    if em == STEGO_METHOD_PSK_HMAC_INPLACE:
+        if not (cfg.link_token or "").strip():
+            raise ValueError("psk_hmac_inplace requires link_token (shared secret token)")
+        sfb = int(meta.get("stego_frag_body_len") or 0)
+        if sfb <= 0:
+            raise ValueError("missing or invalid stego_frag_body_len for psk_hmac_inplace")
+        hi = int(meta.get("hls_index") or 0)
+        ci = int(meta.get("cipher_index") or 0)
+        return extract_psk_inplace(
+            video,
+            token=cfg.link_token.strip(),
+            hls_index=hi,
+            frag_idx=ci,
+            frag_body_len=sfb,
+        )
+    return extract_trailer(video)
+
+
+def _looks_like_psk1(payload: bytes) -> bool:
+    # encrypt_hidden: msg_id(16) || "PSK1"(4) || nonce(12) || ct||tag
+    return len(payload) >= 20 and payload[16:20] == b"PSK1"
+
 
 def _asm_data_key(session_id: str, group_id: str) -> str:
     return f"{ASM_PREFIX}{session_id}:{group_id}:data"
+
+
+def _cipher_b_asm_key(session_id: str, cipher_group: str) -> str:
+    return f"{CIPHER_B_ASM_PREFIX}{session_id}:{cipher_group}:data"
 
 
 async def forward_one(
@@ -43,24 +79,33 @@ async def forward_one(
         hls_total = int(meta.get("hls_total") or 1)
         hls_index = int(meta.get("hls_index") or 0)
         meta_c_url = str(meta.get("c_url") or "").strip()
+        overlay_phase = str(meta.get("overlay_phase") or "media").strip()
+        cipher_group = str(meta.get("cipher_group") or "").strip()
+        cipher_k = int(meta.get("cipher_k") or 0)
+
+        if overlay_phase == "pad":
+            # A 侧追加的伪填充分片：不入队转发
+            return False
 
         if hls_total > 1 and hls_index < hls_total - 1:
             if chunk_total > 1:
                 raise RuntimeError("中间 HLS 分片不应使用字节分块（chunk_total>1）")
-            logging.info(
-                "HLS 纯媒体分片（无隐匿）已跳过 session=%s seq=%s hls=%d/%d",
-                env.session_id,
-                env.seq,
-                hls_index,
-                hls_total - 1,
-            )
-            return False
+            # 旧行为：仅最后一片含隐匿；新行为：cipher 分散到多片时，中间片也可能含 trailer
+            if not cipher_group and cipher_k <= 1:
+                logging.info(
+                    "HLS 纯媒体分片（无隐匿）已跳过 session=%s seq=%s hls=%d/%d",
+                    env.session_id,
+                    env.seq,
+                    hls_index,
+                    hls_total - 1,
+                )
+                return False
 
         if chunk_total <= 1:
             c_url = meta_c_url or cfg.c_base_url
             video = env.unpack_payload()
             try:
-                payload = extract_trailer(video)
+                payload = _extract_stego_payload(video=video, meta=meta, cfg=cfg)
             except ValueError as e:
                 a_url = str(meta.get("a_url") or "").strip()
                 if a_url:
@@ -81,15 +126,88 @@ async def forward_one(
             if not c_url:
                 raise RuntimeError("未配置目标 C：control 中 c_url 为空且未设置 b-worker --c-url")
 
+            cg = str(meta.get("cipher_group") or "").strip()
+            ck = int(meta.get("cipher_k") or 0)
+            if cg and ck > 1:
+                ci = int(meta.get("cipher_index") or 0)
+                cipher_bytes_real = int(meta.get("cipher_bytes") or 0)
+                if ci < 0 or ci >= ck:
+                    raise RuntimeError(f"bad cipher_index={ci} for cipher_k={ck}")
+                dkey = _cipher_b_asm_key(env.session_id, cg)
+                async with _cipher_asm_lock:
+                    # 方案 B：密文被均分为 k 份。只有第 0 片应以 "PSK1" 开头（整包 AEAD 格式头），
+                    # 可用作“防误判”哨兵：若第 0 片不是 PSK1，则多半是误提取（MAGIC 撞车）或数据损坏。
+                    if ci == 0 and not _looks_like_psk1(payload):
+                        logging.warning(
+                            "cipher 分片 idx=0 非 PSK1，疑似误提取/损坏：session=%s group=%s… bytes=%d（丢弃该片）",
+                            env.session_id,
+                            cg[:16],
+                            len(payload),
+                        )
+                        await redis.delete(dkey)
+                        return False
+                    await redis.hset(dkey, mapping={str(ci): payload})
+                    await redis.expire(dkey, 7200)
+                    n_parts = await redis.hlen(dkey)
+                    if n_parts < ck:
+                        logging.info(
+                            "cipher 分片缓冲 session=%s group=%s… idx=%d/%d hlen=%d",
+                            env.session_id,
+                            cg[:16],
+                            ci,
+                            ck - 1,
+                            n_parts,
+                        )
+                        return False
+                    blobs: list[bytes] = []
+                    for i in range(ck):
+                        b = await redis.hget(dkey, str(i))
+                        if b is None:
+                            raise RuntimeError(f"cipher fragment missing i={i}")
+                        blobs.append(b)
+                    payload = b"".join(blobs)
+                    await redis.delete(dkey)
+                # A 侧可能把密文补齐到 k*g_bytes（便于固定片大小）；这里按真实密文长度截断，否则 GCM tag 会 InvalidTag。
+                if cipher_bytes_real > 0:
+                    payload = payload[:cipher_bytes_real]
+                if not _looks_like_psk1(payload):
+                    logging.warning(
+                        "cipher 组装完成但非 PSK1，疑似误提取/分片错配：session=%s group=%s… bytes=%d（丢弃）",
+                        env.session_id,
+                        cg[:16],
+                        len(payload),
+                    )
+                    return False
+                logging.info(
+                    "cipher 已在 B 组装完成 session=%s group=%s… bytes=%d -> C",
+                    env.session_id,
+                    cg[:16],
+                    len(payload),
+                )
+            else:
+                # k=1（整包密文在 trailer 中）：也做一次快速校验，避免 MAGIC 撞车导致把随机字节发给 C。
+                if not _looks_like_psk1(payload):
+                    logging.info(
+                        "trailer 提取到非 PSK1 payload，视为误提取并跳过：session=%s seq=%s bytes=%d",
+                        env.session_id,
+                        env.seq,
+                        len(payload),
+                    )
+                    return False
+
             url = f"{c_url.rstrip('/')}/recv"
+            ext_hdr = str(meta.get("extract_method") or STEGO_METHOD_PSK_HMAC_INPLACE).strip()
             headers = {
                 "Content-Type": "application/octet-stream",
                 "X-Overlay": "1",
-                "X-Overlay-Extract": "append_marker",
+                "X-Overlay-Extract": ext_hdr,
                 "X-Session": env.session_id,
                 "X-Seq": str(env.seq),
                 "X-T0-MS": str(env.t0_ms),
                 "X-B-SEND-MS": str(send_ms),
+                "X-Bishe-HLS-Index": str(hls_index),
+                "X-Bishe-HLS-Total": str(hls_total),
+                "X-Bishe-Cipher-Index": str(int(meta.get("cipher_index") or 0)),
             }
             r = await client.post(url, content=payload, headers=headers)
             if r.status_code != 200:
@@ -131,7 +249,7 @@ async def forward_one(
         video = b"".join(blobs)
 
         try:
-            payload = extract_trailer(video)
+            payload = _extract_stego_payload(video=video, meta=meta, cfg=cfg)
         except ValueError as e:
             a_url = str(meta.get("a_url") or "").strip()
             if a_url:
@@ -153,15 +271,87 @@ async def forward_one(
 
         await redis.delete(dkey)
 
+        # 组装后同样按 overlay meta 走“是否为密文/分片”的筛选与组装逻辑，避免误提取 trailer 直接打到 C。
+        cg = str(meta.get("cipher_group") or "").strip()
+        ck = int(meta.get("cipher_k") or 0)
+        if cg and ck > 1:
+            ci = int(meta.get("cipher_index") or 0)
+            cipher_bytes_real = int(meta.get("cipher_bytes") or 0)
+            if ci < 0 or ci >= ck:
+                raise RuntimeError(f"bad cipher_index={ci} for cipher_k={ck}")
+            dkey2 = _cipher_b_asm_key(sid, cg)
+            async with _cipher_asm_lock:
+                if ci == 0 and not _looks_like_psk1(payload):
+                    logging.warning(
+                        "cipher 分片(idx=0)非 PSK1（chunk-asm 后），疑似误提取/损坏：session=%s group=%s… bytes=%d（丢弃该片）",
+                        sid,
+                        cg[:16],
+                        len(payload),
+                    )
+                    await redis.delete(dkey2)
+                    return False
+                await redis.hset(dkey2, mapping={str(ci): payload})
+                await redis.expire(dkey2, 7200)
+                n2 = await redis.hlen(dkey2)
+                if n2 < ck:
+                    logging.info(
+                        "cipher 分片缓冲（chunk-asm 后）session=%s group=%s… idx=%d/%d hlen=%d",
+                        sid,
+                        cg[:16],
+                        ci,
+                        ck - 1,
+                        n2,
+                    )
+                    return False
+                blobs2: list[bytes] = []
+                for i in range(ck):
+                    b = await redis.hget(dkey2, str(i))
+                    if b is None:
+                        raise RuntimeError(f"cipher fragment missing i={i}")
+                    blobs2.append(b)
+                payload = b"".join(blobs2)
+                await redis.delete(dkey2)
+            if cipher_bytes_real > 0:
+                payload = payload[:cipher_bytes_real]
+            if not _looks_like_psk1(payload):
+                logging.warning(
+                    "cipher 组装完成但非 PSK1（chunk-asm 后），疑似误提取/错配：session=%s group=%s… bytes=%d（丢弃）",
+                    sid,
+                    cg[:16],
+                    len(payload),
+                )
+                return False
+            logging.info(
+                "cipher 已在 B 组装完成（chunk-asm 后）session=%s group=%s… bytes=%d -> C",
+                sid,
+                cg[:16],
+                len(payload),
+            )
+        else:
+            if not _looks_like_psk1(payload):
+                logging.info(
+                    "trailer 提取到非 PSK1 payload（chunk-asm 后），视为误提取并跳过：session=%s seq=%s bytes=%d",
+                    sid,
+                    env.seq,
+                    len(payload),
+                )
+                return False
+
         url = f"{c_url.rstrip('/')}/recv"
+        hi = int(meta.get("hls_index") or 0)
+        ht = int(meta.get("hls_total") or 1)
+        ext_hdr2 = str(meta.get("extract_method") or STEGO_METHOD_PSK_HMAC_INPLACE).strip()
         headers = {
             "Content-Type": "application/octet-stream",
             "X-Overlay": "1",
-            "X-Overlay-Extract": "append_marker",
+            "X-Overlay-Extract": ext_hdr2,
             "X-Session": sid,
             "X-Seq": str(env.seq),
             "X-T0-MS": str(env.t0_ms),
             "X-B-SEND-MS": str(send_ms),
+            "X-Bishe-HLS-Index": str(hi),
+            "X-Bishe-HLS-Total": str(ht),
+            "X-Bishe-Cipher-Index": str(int(meta.get("cipher_index") or 0)),
         }
         r = await client.post(url, content=payload, headers=headers)
         if r.status_code != 200:
@@ -175,6 +365,17 @@ async def forward_one(
 
     url = f"{c_url.rstrip('/')}/recv"
     payload = env.unpack_payload()
+
+    # 兜底保护：只要要发给 C 的不是 PSK1 AEAD 包，就直接丢弃。
+    # 否则（例如 b-pull 误把某些“非媒体/非密文”任务塞进队列）会导致 C 被大量 400 轰炸。
+    if not _looks_like_psk1(payload):
+        logging.info(
+            "默认转发分支检测到非 PSK1 payload，跳过：session=%s seq=%s bytes=%d",
+            env.session_id,
+            env.seq,
+            len(payload),
+        )
+        return False
 
     headers = {
         "Content-Type": env.content_type or "application/octet-stream",
@@ -191,15 +392,28 @@ async def forward_one(
     return True
 
 
-async def run_b_worker(*, redis_url: str, queue_key: str, c_base_url: str) -> None:
+async def run_b_worker(
+    *,
+    redis_url: str,
+    queue_key: str,
+    c_base_url: str,
+    psk: bytes | None = None,
+    link_token: str = "",
+) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    cfg = BWorkerConfig(redis_url=redis_url, queue_key=queue_key, c_base_url=c_base_url)
+    cfg = BWorkerConfig(
+        redis_url=redis_url,
+        queue_key=queue_key,
+        c_base_url=c_base_url,
+        psk=psk,
+        link_token=link_token or "",
+    )
 
     redis = Redis.from_url(redis_url, decode_responses=False)
     await redis.ping()
     logging.info("B worker 已连接 Redis: %s (queue=%s) -> C=%s", redis_url, queue_key, c_base_url)
 
-    async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
+    async with httpx.AsyncClient(timeout=120.0, verify=False, trust_env=False) as client:
         try:
             while True:
                 item = await redis.blpop(queue_key, timeout=cfg.blpop_timeout_s)

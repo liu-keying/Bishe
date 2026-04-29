@@ -43,12 +43,28 @@ def _envelope_from_get_response(r: httpx.Response, fallback_session: str, a_base
     }
 
     if kind == "media":
+        overlay_phase = (r.headers.get("X-Bishe-Overlay-Phase") or "media").strip()
         meta = {
             **base_meta,
-            "overlay_phase": "media",
+            "overlay_phase": overlay_phase,
         }
         if stego_hdr:
             meta["extract_method"] = stego_hdr
+        cg = (r.headers.get("X-Bishe-Cipher-Group") or "").strip()
+        if cg:
+            meta["cipher_group"] = cg
+        ck = (r.headers.get("X-Bishe-Cipher-K") or "").strip()
+        if ck.isdigit():
+            meta["cipher_k"] = int(ck)
+        ci = (r.headers.get("X-Bishe-Cipher-Index") or "").strip()
+        if ci.isdigit():
+            meta["cipher_index"] = int(ci)
+        cb = (r.headers.get("X-Bishe-Cipher-Bytes") or "").strip()
+        if cb.isdigit():
+            meta["cipher_bytes"] = int(cb)
+        sfb = (r.headers.get("X-Chunk-Size") or "").strip()
+        if sfb.isdigit():
+            meta["stego_frag_body_len"] = int(sfb)
         mg = (r.headers.get("X-Bishe-Media-Group") or "").strip()
         if mg:
             meta["media_group_id"] = mg
@@ -113,7 +129,7 @@ async def run_b_pull(
 
     media_playlist_url: str | None = None
     try:
-        async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=120.0, verify=False, trust_env=False) as client:
             while True:
                 if media_playlist_url is None:
                     master_url = f"{cfg.a_base_url}{make_hls_master_path(live_session[0])}"

@@ -49,6 +49,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p.add_argument("--c-url", default=os.environ.get("BISHE_C_URL", "http://127.0.0.1:8002"))
+    p.add_argument(
+        "--e-url",
+        default=os.environ.get("BISHE_E_URL", ""),
+        help="控制面 E 的 base url（如 http://127.0.0.1:8009）；用于下发 PSK + token 并启用数据面加密",
+    )
+    p.add_argument(
+        "--b-gate-url",
+        default=os.environ.get("BISHE_B_GATE_URL", ""),
+        help="可选，B-gate base url（如 http://127.0.0.1:8010）；A/C 拿到 token 后将自动注册以启动拉流",
+    )
     p.add_argument("--token-secret", default=os.environ.get("BISHE_TOKEN_SECRET", ""), help="E/B-gate token 签名密钥")
     p.add_argument(
         "--ssl-cert",
@@ -68,7 +78,14 @@ async def _amain() -> None:
 
     if args.role == "a":
         sid = (args.session or "").strip() or None
-        await run_a_proxy(host=args.host, port=args.port, session_id=sid)
+        await run_a_proxy(
+            host=args.host,
+            port=args.port,
+            session_id=sid,
+            e_url=(args.e_url or "").strip(),
+            c_url=args.c_url,
+            b_gate_url=(args.b_gate_url or "").strip(),
+        )
         return
     if args.role == "b-pull":
         await run_b_pull(
@@ -96,7 +113,15 @@ async def _amain() -> None:
     if args.role == "c":
         cert = (args.ssl_cert or "").strip() or None
         key = (args.ssl_key or "").strip() or None
-        await run_c_server(host=args.host, port=args.port, ssl_certfile=cert, ssl_keyfile=key)
+        await run_c_server(
+            host=args.host,
+            port=args.port,
+            ssl_certfile=cert,
+            ssl_keyfile=key,
+            e_url=(args.e_url or "").strip(),
+            a_url=(args.a_url or "").strip(),
+            b_gate_url=(args.b_gate_url or "").strip(),
+        )
         return
     if args.role == "e":
         secret = (args.token_secret or "").strip() or e_env_secret()

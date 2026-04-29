@@ -6,9 +6,13 @@ import ssl
 import uuid
 from pathlib import Path
 
+import httpx
 from aiohttp import web
 
 from .common import now_ms
+from .crypto_box import aead_decrypt, b64d, b64e, generate_rsa_keypair, rsa_oaep_unwrap, rsa_pub_to_pem
+from .psk_aead import decrypt_hidden
+from .stego import STEGO_METHOD_PSK_HMAC_INPLACE
 
 
 def _percentile(sorted_vals: list[float], p: float) -> float | None:
@@ -26,6 +30,16 @@ def _percentile(sorted_vals: list[float], p: float) -> float | None:
 
 async def handle_recv(request: web.Request) -> web.Response:
     payload = await request.read()
+    psk: bytes | None = request.app.get("psk")
+    if psk is None:
+        return web.json_response({"ok": False, "error": "PSK not ready (start C with --e-url and wait kex)"}, status=503)
+
+    try:
+        session_id_hdr = str(request.headers.get("X-Session", "") or "")
+        aad = session_id_hdr.encode("utf-8")
+        payload = decrypt_hidden(psk=psk, payload=payload, aad=aad)
+    except Exception as e:
+        return web.json_response({"ok": False, "error": f"decrypt failed: {e!r}"}, status=400)
 
     t0_ms = int(request.headers.get("X-T0-MS", "0") or "0")
     b_send_ms = int(request.headers.get("X-B-SEND-MS", "0") or "0")
@@ -145,11 +159,73 @@ async def run_c_server(
     port: int,
     ssl_certfile: str | None = None,
     ssl_keyfile: str | None = None,
+    e_url: str = "",
+    a_url: str = "",
+    b_gate_url: str = "",
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    app = web.Application()
+    # /recv 可能承载“整段密文”或更大的 trailer，默认 1MB 会触发 413
+    app = web.Application(client_max_size=256 * 1024 * 1024)
     app["stats"] = {"start_ms": now_ms(), "recv_count": 0, "dup_count": 0, "recv_bytes": 0, "events": [], "seen_msg_ids": set()}
+    app["psk"] = None
+    app["link_token"] = ""
+
+    e_url2 = (e_url or "").strip()
+    a_url2 = (a_url or "").strip()
+    if e_url2 and a_url2:
+        c_base = f"http://{host}:{port}"
+        priv, pub = generate_rsa_keypair(bits=2048)
+        pub_b64 = b64e(rsa_pub_to_pem(pub))
+        link = f"{a_url2.rstrip('/')}|{c_base.rstrip('/')}|{STEGO_METHOD_PSK_HMAC_INPLACE}"
+        aad = link.encode("utf-8")
+        async with httpx.AsyncClient(timeout=10.0, verify=False, trust_env=False) as client:
+            while True:
+                r = await client.post(
+                    f"{e_url2.rstrip('/')}/issue",
+                    json={
+                        "role": "c",
+                        "a_url": a_url2,
+                        "c_url": c_base,
+                        "extract_method": STEGO_METHOD_PSK_HMAC_INPLACE,
+                        "ttl_s": 600,
+                        "pubkey": pub_b64,
+                    },
+                )
+                r.raise_for_status()
+                obj = r.json()
+                if obj.get("ok") is not True:
+                    raise SystemExit(f"E /issue failed: {obj!r}")
+                if obj.get("pending"):
+                    await asyncio.sleep(float(obj.get("retry_after_s") or 0.5))
+                    continue
+                bundle = obj.get("bundle") or {}
+                import json
+
+                ek_psk = b64d(str(bundle.get("ek_psk") or ""))
+                nonce = b64d(str(bundle.get("nonce") or ""))
+                ct = b64d(str(bundle.get("ciphertext") or ""))
+                psk = rsa_oaep_unwrap(recipient_priv=priv, wrapped=ek_psk)
+                pt = aead_decrypt(key32=psk, nonce=nonce, ciphertext=ct, aad=aad)
+                data = json.loads(pt.decode("utf-8"))
+                psk_b64 = b64e(psk)
+                token = str(data.get("token") or "")
+                if not psk_b64:
+                    raise SystemExit(f"E bundle missing psk_b64: {data!r}")
+                if not token:
+                    raise SystemExit(f"E bundle missing token: {data!r}")
+                app["psk"] = b64d(psk_b64)
+                app["link_token"] = token
+                logging.info("C 已从 E 获取 PSK（数据面解密启用）")
+                bg = (b_gate_url or "").strip()
+                if bg:
+                    rr = await client.post(
+                        f"{bg.rstrip('/')}/register",
+                        json={"role": "c", "token": token, "psk_b64": b64e(app["psk"])},
+                    )
+                    rr.raise_for_status()
+                    logging.info("C 已向 B-gate 注册（role=c）")
+                break
     app.router.add_post("/recv", handle_recv)
     app.router.add_get("/stats", handle_stats)
     app.router.add_post("/stats/reset", handle_reset_stats)

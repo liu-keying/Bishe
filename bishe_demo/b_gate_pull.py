@@ -9,6 +9,7 @@ from aiohttp import web
 
 from .b_pull import run_b_pull
 from .b_worker import run_b_worker
+from .crypto_box import b64d
 from .token_util import TokenClaims, verify_token
 
 
@@ -31,7 +32,7 @@ async def _post_stop_notice(url: str, *, who: str) -> None:
     import httpx
 
     try:
-        async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=5.0, verify=False, trust_env=False) as client:
             await client.post(url, json={"ok": True, "who": who})
     except Exception:
         return
@@ -40,6 +41,8 @@ async def _post_stop_notice(url: str, *, who: str) -> None:
 def _reset_gate_state(app: web.Application) -> None:
     app["reg"] = {"a": False, "c": False}
     app["claims"] = None
+    app["link_psk"] = None
+    app["link_token"] = ""
     app["pull_task"] = None
     app["worker_task"] = None
 
@@ -63,6 +66,20 @@ async def handle_register(request: web.Request) -> web.Response:
     reg = request.app["reg"]
     reg[role] = True
     request.app["claims"] = claims
+    request.app["link_token"] = token
+
+    psk_b64 = str(body.get("psk_b64") or "").strip()
+    if psk_b64:
+        try:
+            raw_psk = b64d(psk_b64)
+        except Exception as e:
+            return web.json_response({"ok": False, "error": f"bad psk_b64: {e!r}"}, status=400)
+        if len(raw_psk) != 32:
+            return web.json_response({"ok": False, "error": "psk_b64 must decode to 32 bytes"}, status=400)
+        prev = request.app.get("link_psk")
+        if prev is not None and prev != raw_psk:
+            return web.json_response({"ok": False, "error": "psk mismatch between A and C register"}, status=400)
+        request.app["link_psk"] = raw_psk
 
     # 两边都登记成功 -> gate 同时启动 b-pull + b-worker
     if reg.get("a") and reg.get("c") and request.app.get("pull_task") is None:
@@ -88,7 +105,13 @@ async def handle_register(request: web.Request) -> web.Response:
             )
         )
         request.app["worker_task"] = asyncio.create_task(
-            run_b_worker(redis_url=cfg.redis_url, queue_key=cfg.queue_key, c_base_url=c_url)
+            run_b_worker(
+                redis_url=cfg.redis_url,
+                queue_key=cfg.queue_key,
+                c_base_url=c_url,
+                psk=request.app.get("link_psk"),
+                link_token=str(request.app.get("link_token") or ""),
+            )
         )
 
     return web.json_response(
@@ -172,6 +195,8 @@ async def run_b_gate_pull(
     app["cfg"] = cfg
     app["reg"] = {"a": False, "c": False}
     app["claims"] = None
+    app["link_psk"] = None
+    app["link_token"] = ""
     app["pull_task"] = None
     app["worker_task"] = None
     app.router.add_get("/health", handle_health)

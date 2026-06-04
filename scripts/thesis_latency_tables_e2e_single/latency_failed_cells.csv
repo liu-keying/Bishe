@@ -1,5 +1,0 @@
-hidden_bytes,segments_limit,k,sent_ok,sent_err,loss,note
-65536,6,1,0,1,0,
-65536,9,1,0,1,0,
-65536,12,1,0,1,0,
-65536,15,1,0,1,0,

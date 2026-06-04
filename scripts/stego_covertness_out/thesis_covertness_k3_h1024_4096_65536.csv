@@ -1,4 +1,0 @@
-hidden_bytes,g_bytes,R_modified_pct_mean,R_modified_pct_max,delta_H_pct_mean,delta_H_pct_stdev,chi2_homogeneity_p_min,chi2_homogeneity_p_min_raw,k,pad_bytes,n_segments,source
-1024,352,0.0051,0.0060,0.066,0.023,1.0,1.0,3,0,6,metrics_summary_by_config.csv k3_h1024_pad0
-4096,1376,0.0193,0.0229,0.246,0.083,1.0,1.0,3,0,6,metrics_summary_by_config.csv k3_h4096_pad0
-65536,21856,0.303,0.359,2.920,1.827,0.0,1.5577058118585285e-58,3,0,6,metrics_summary_by_config.csv k3_h65536_pad0

@@ -1,5 +1,0 @@
-hidden_bytes_B,segments_limit,mean_e2e_ms_p50_avg_k,mean_p95_ms_avg_k,delta_p50_vs_seg6_ms,delta_p50_vs_seg6_pct
-1024,6,278.0,278.0,0.0,0.0
-1024,9,150.8,150.8,-127.2,-45.77
-1024,12,203.8,203.8,-74.2,-26.71
-1024,15,160.5,160.5,-117.5,-42.27

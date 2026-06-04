@@ -1,5 +1,0 @@
-﻿hidden_bytes,k,segments_limit,mean_throughput_Bps,stdev_Bps,n_runs
-1024,1,6,805.55,20.05,3
-1024,1,9,537.41,2.47,3
-1024,1,12,404.83,4.8,3
-1024,1,15,320.38,0.82,3

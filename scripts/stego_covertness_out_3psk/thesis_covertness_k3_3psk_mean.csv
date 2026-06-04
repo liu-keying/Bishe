@@ -1,4 +1,0 @@
-hidden_bytes,n_psk,modified_ratio_pct_mean,modified_ratio_pct_max,delta_H_pct_mean,delta_H_pct_stdev_across_psk,chi2_p_min_across_psk,chi2_p_max_across_psk
-1024,3,0.00510,0.00606,0.0624,0.00354,1.0,1.0
-4096,3,0.0193,0.0229,0.243,0.00711,1.0,1.0
-65536,3,0.303,0.359,3.79,0.0315,2.61E-64,1.07E-63

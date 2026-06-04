@@ -1,4 +1,0 @@
-﻿hidden_bytes,mean_loss_rate,stdev_across_configs,n_runs
-1024,0.0,0.0,48
-4096,0.0,0.0,48
-65536,0.0,0.0,48

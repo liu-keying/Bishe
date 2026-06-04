@@ -1,0 +1,5 @@
+﻿segments_limit,hidden=1024 B/s,hidden=4096,hidden=65536,note
+6,805.55,3222.48,18048.73,"k=1, mean of 3 runs"
+9,537.41,750.98,11896.49,"k=1, mean of 3 runs"
+12,404.83,1588.7,25206.36,"k=1, mean of 3 runs"
+15,320.38,1171.48,20345.19,"k=1, mean of 3 runs"

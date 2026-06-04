@@ -1,0 +1,11 @@
+{
+  "k": 1,
+  "g_bytes": 4128,
+  "cipher_bytes_real": 4128,
+  "chosen_indices": [
+    4
+  ],
+  "pad_psk_len": 4144,
+  "pad_bytes_tail": 188,
+  "plain_hidden_bytes": 4096
+}

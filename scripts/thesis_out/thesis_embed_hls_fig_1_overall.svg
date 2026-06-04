@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="580" height="460" font-family="Microsoft YaHei,SimHei,sans-serif" font-size="12">
+<rect width="100%" height="100%" fill="#fafafa"/>
+<rect x="30" y="30" width="520" height="388" fill="white" stroke="#ccc"/>
+<text x="50" y="20" font-size="14" font-weight="bold">不同隐蔽数据规模下的平均吞吐 (4×4 合并统计)</text>
+<line x1="95.0" y1="318.0" x2="515.0" y2="318.0" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="244.69186222110193" x2="515.0" y2="244.69186222110193" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="171.38372444220383" x2="515.0" y2="171.38372444220383" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="318.0" x2="515.0" y2="318.0" stroke="#222" stroke-width="1.5"/>
+<line x1="95.0" y1="318.0" x2="95.0" y2="102.0" stroke="#222" stroke-width="1.5"/>
+<line x1="95.0" y1="318.0" x2="90.0" y2="318.0" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="322.0" text-anchor="end" font-size="10" fill="#222">0 B/s</text>
+<line x1="95.0" y1="244.69186222110193" x2="90.0" y2="244.69186222110193" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="248.69186222110193" text-anchor="end" font-size="10" fill="#222">10000 B/s</text>
+<line x1="95.0" y1="171.38372444220383" x2="90.0" y2="171.38372444220383" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="175.38372444220383" text-anchor="end" font-size="10" fill="#222">20000 B/s</text>
+<text x="305.0" y="360.0" text-anchor="middle" font-size="11" fill="#222">hidden_bytes / B</text>
+<line x1="165.0" y1="318.0" x2="165.0" y2="323.0" stroke="#222"/>
+<text x="165.0" y="338.0" text-anchor="middle" font-size="10" fill="#222">1024B</text>
+<line x1="305.0" y1="318.0" x2="305.0" y2="323.0" stroke="#222"/>
+<text x="305.0" y="338.0" text-anchor="middle" font-size="10" fill="#222">4096B</text>
+<line x1="445.0" y1="318.0" x2="445.0" y2="323.0" stroke="#222"/>
+<text x="445.0" y="338.0" text-anchor="middle" font-size="10" fill="#222">65536B</text>
+<text x="22" y="210.0" text-anchor="middle" font-size="11" fill="#222" transform="rotate(-90 22 210.0)">平均吞吐量 / (B/s)</text>
+<rect x="126.5" y="314.23335457278245" width="77.0" height="3.7666454272175542" fill="#4C72B0"/><text x="165.0" y="308.23335457278245" text-anchor="middle" font-size="10" fill="#222">514</text>
+<rect x="266.5" y="306.8085597622601" width="77.0" height="11.191440237739926" fill="#55A868"/><text x="305.0" y="300.8085597622601" text-anchor="middle" font-size="10" fill="#222">1527</text>
+<rect x="406.5" y="125.14285714285717" width="77.0" height="192.85714285714283" fill="#C44E52"/><text x="445.0" y="119.14285714285717" text-anchor="middle" font-size="10" fill="#222">26308</text>
+</svg>

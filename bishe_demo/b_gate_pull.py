@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from aiohttp import web
 
 from .b_pull import run_b_pull
+from .b_reliability import ReliabilityConfig
 from .b_worker import run_b_worker
 from .crypto_box import b64d
 from .token_util import TokenClaims, verify_token
@@ -20,7 +21,11 @@ class BGateConfig:
     redis_url: str
     queue_key: str
     poll_interval_s: float
+    segment_interval_s: float
     token_secret: str
+    control_host: str
+    control_port: int
+    reliability: ReliabilityConfig
 
 
 def _claims_from_token(cfg: BGateConfig, token: str) -> TokenClaims:
@@ -102,6 +107,7 @@ async def handle_register(request: web.Request) -> web.Response:
                 redis_url=cfg.redis_url,
                 queue_key=cfg.queue_key,
                 poll_interval_s=cfg.poll_interval_s,
+                segment_interval_s=cfg.segment_interval_s,
             )
         )
         request.app["worker_task"] = asyncio.create_task(
@@ -111,6 +117,9 @@ async def handle_register(request: web.Request) -> web.Response:
                 c_base_url=c_url,
                 psk=request.app.get("link_psk"),
                 link_token=str(request.app.get("link_token") or ""),
+                control_host=cfg.control_host,
+                control_port=cfg.control_port,
+                reliability=cfg.reliability,
             )
         )
 
@@ -179,16 +188,26 @@ async def run_b_gate_pull(
     redis_url: str,
     queue_key: str,
     poll_interval_s: float,
+    segment_interval_s: float = 0.0,
     token_secret: str,
+    control_host: str = "127.0.0.1",
+    control_port: int | None = None,
+    reliability: ReliabilityConfig | None = None,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    cport = int(control_port) if control_port is not None else int(port) + 1
+    rcfg = reliability if reliability is not None else ReliabilityConfig()
     cfg = BGateConfig(
         host=host,
         port=port,
         redis_url=redis_url,
         queue_key=queue_key,
         poll_interval_s=poll_interval_s,
+        segment_interval_s=max(0.0, float(segment_interval_s)),
         token_secret=token_secret,
+        control_host=control_host,
+        control_port=cport,
+        reliability=rcfg,
     )
 
     app = web.Application()

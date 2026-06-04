@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="620" height="486" font-family="Microsoft YaHei,SimHei,sans-serif" font-size="12">
+<rect width="100%" height="100%" fill="#fafafa"/>
+<rect x="30" y="30" width="520" height="416" fill="white" stroke="#ccc"/>
+<text x="50" y="20" font-size="14" font-weight="bold">固定HLS分片数=6：密文分片数 k 与 p50（实线）/ p95（虚线）</text>
+<line x1="95.0" y1="318.0" x2="515.0" y2="318.0" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="256.09007893514934" x2="515.0" y2="256.09007893514934" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="194.18015787029873" x2="515.0" y2="194.18015787029873" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="132.2702368054481" x2="515.0" y2="132.2702368054481" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="318.0" x2="515.0" y2="318.0" stroke="#222" stroke-width="1.5"/>
+<line x1="95.0" y1="318.0" x2="95.0" y2="102.0" stroke="#222" stroke-width="1.5"/>
+<line x1="95.0" y1="318.0" x2="90.0" y2="318.0" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="322.0" text-anchor="end" font-size="10" fill="#222">0 ms</text>
+<line x1="95.0" y1="256.09007893514934" x2="90.0" y2="256.09007893514934" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="260.09007893514934" text-anchor="end" font-size="10" fill="#222">20000 ms</text>
+<line x1="95.0" y1="194.18015787029873" x2="90.0" y2="194.18015787029873" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="198.18015787029873" text-anchor="end" font-size="10" fill="#222">40000 ms</text>
+<line x1="95.0" y1="132.2702368054481" x2="90.0" y2="132.2702368054481" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="136.2702368054481" text-anchor="end" font-size="10" fill="#222">60000 ms</text>
+<text x="305.0" y="360.0" text-anchor="middle" font-size="11" fill="#222">密文分片数 k / 个</text>
+<line x1="95.0" y1="318.0" x2="95.0" y2="323.0" stroke="#222"/>
+<text x="95.0" y="338.0" text-anchor="middle" font-size="10" fill="#222">1</text>
+<line x1="235.0" y1="318.0" x2="235.0" y2="323.0" stroke="#222"/>
+<text x="235.0" y="338.0" text-anchor="middle" font-size="10" fill="#222">2</text>
+<line x1="375.0" y1="318.0" x2="375.0" y2="323.0" stroke="#222"/>
+<text x="375.0" y="338.0" text-anchor="middle" font-size="10" fill="#222">3</text>
+<line x1="515.0" y1="318.0" x2="515.0" y2="323.0" stroke="#222"/>
+<text x="515.0" y="338.0" text-anchor="middle" font-size="10" fill="#222">5</text>
+<text x="22" y="210.0" text-anchor="middle" font-size="11" fill="#222" transform="rotate(-90 22 210.0)">时延 / (ms)</text>
+<polyline fill="none" stroke="#4C72B0" stroke-width="2.5" points="95.0,246.5889697157303 235.0,251.01862456792034 375.0,248.9147190837332 515.0,248.6154877985864"/>
+<polyline fill="none" stroke="#4C72B0" stroke-width="2" stroke-dasharray="7,5" opacity="0.85" points="95.0,197.00531393489138 235.0,203.5770520559253 375.0,201.3575813857504 515.0,201.97668059639892"/>
+<circle cx="95.0" cy="246.5889697157303" r="4" fill="#4C72B0" stroke="white" stroke-width="1"/>
+<circle cx="235.0" cy="251.01862456792034" r="4" fill="#4C72B0" stroke="white" stroke-width="1"/>
+<circle cx="375.0" cy="248.9147190837332" r="4" fill="#4C72B0" stroke="white" stroke-width="1"/>
+<circle cx="515.0" cy="248.6154877985864" r="4" fill="#4C72B0" stroke="white" stroke-width="1"/>
+<polyline fill="none" stroke="#55A868" stroke-width="2.5" points="95.0,250.65335603363772 235.0,248.6763658876335 375.0,196.54202135892277 515.0,212.68606510860033"/>
+<polyline fill="none" stroke="#55A868" stroke-width="2" stroke-dasharray="7,5" opacity="0.85" points="95.0,202.0767683021204 235.0,201.84254243409174 375.0,118.0 515.0,151.22911829954083"/>
+<circle cx="95.0" cy="250.65335603363772" r="4" fill="#55A868" stroke="white" stroke-width="1"/>
+<circle cx="235.0" cy="248.6763658876335" r="4" fill="#55A868" stroke="white" stroke-width="1"/>
+<circle cx="375.0" cy="196.54202135892277" r="4" fill="#55A868" stroke="white" stroke-width="1"/>
+<circle cx="515.0" cy="212.68606510860033" r="4" fill="#55A868" stroke="white" stroke-width="1"/>
+<polyline fill="none" stroke="#C44E52" stroke-width="2.5" points="95.0,219.01119537739257 235.0,256.5678171593664 375.0,244.68523964298612 515.0,242.56895217458597"/>
+<polyline fill="none" stroke="#C44E52" stroke-width="2" stroke-dasharray="7,5" opacity="0.85" points="95.0,158.5716349378321 235.0,218.88943919929835 375.0,188.8847959552185 515.0,187.09044007635555"/>
+<circle cx="95.0" cy="219.01119537739257" r="4" fill="#C44E52" stroke="white" stroke-width="1"/>
+<circle cx="235.0" cy="256.5678171593664" r="4" fill="#C44E52" stroke="white" stroke-width="1"/>
+<circle cx="375.0" cy="244.68523964298612" r="4" fill="#C44E52" stroke="white" stroke-width="1"/>
+<circle cx="515.0" cy="242.56895217458597" r="4" fill="#C44E52" stroke="white" stroke-width="1"/>
+<rect x="95.0" y="376.0" width="10" height="10" fill="#4C72B0"/><text x="109.0" y="385.0" font-size="11" font-weight="600" fill="#222">1024 B</text>
+<rect x="183.0" y="376.0" width="10" height="10" fill="#55A868"/><text x="197.0" y="385.0" font-size="11" font-weight="600" fill="#222">4096 B</text>
+<rect x="271.0" y="376.0" width="10" height="10" fill="#C44E52"/><text x="285.0" y="385.0" font-size="11" font-weight="600" fill="#222">65536 B</text>
+<text x="95.0" y="398.0" font-size="11" font-weight="600" fill="#111">说明：同色为同档 hidden_bytes；粗实线 p50，虚线 p95。</text>
+</svg>

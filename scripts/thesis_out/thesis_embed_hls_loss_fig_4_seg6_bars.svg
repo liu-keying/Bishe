@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="580" height="480" font-family="Microsoft YaHei,SimHei,sans-serif" font-size="12">
+<rect width="100%" height="100%" fill="#fafafa"/>
+<rect x="30" y="30" width="520" height="400" fill="white" stroke="#ccc"/>
+<text x="50" y="20" font-size="14" font-weight="bold">固定HLS分片数=6：平均丢包率对比（%）</text>
+<line x1="95.0" y1="318.0" x2="515.0" y2="318.0" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="102.0" x2="515.0" y2="102.0" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="318.0" x2="515.0" y2="318.0" stroke="#222" stroke-width="1.5"/>
+<line x1="95.0" y1="318.0" x2="95.0" y2="102.0" stroke="#222" stroke-width="1.5"/>
+<line x1="95.0" y1="318.0" x2="90.0" y2="318.0" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="322.0" text-anchor="end" font-size="10" fill="#222">0 %</text>
+<line x1="95.0" y1="102.0" x2="90.0" y2="102.0" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="106.0" text-anchor="end" font-size="10" fill="#222">0 %</text>
+<text x="305.0" y="360.0" text-anchor="middle" font-size="11" fill="#222">密文分片数 k / 个</text>
+<line x1="147.5" y1="318.0" x2="147.5" y2="323.0" stroke="#222"/>
+<text x="147.5" y="338.0" text-anchor="middle" font-size="10" fill="#222">1</text>
+<line x1="252.5" y1="318.0" x2="252.5" y2="323.0" stroke="#222"/>
+<text x="252.5" y="338.0" text-anchor="middle" font-size="10" fill="#222">2</text>
+<line x1="357.5" y1="318.0" x2="357.5" y2="323.0" stroke="#222"/>
+<text x="357.5" y="338.0" text-anchor="middle" font-size="10" fill="#222">3</text>
+<line x1="462.5" y1="318.0" x2="462.5" y2="323.0" stroke="#222"/>
+<text x="462.5" y="338.0" text-anchor="middle" font-size="10" fill="#222">5</text>
+<text x="22" y="210.0" text-anchor="middle" font-size="11" fill="#222" transform="rotate(-90 22 210.0)">丢包率 / (%)</text>
+<rect x="113.9" y="318.0" width="27.63157894736842" height="0.0" fill="#4C72B0"/>
+<rect x="144.53157894736842" y="318.0" width="27.63157894736842" height="0.0" fill="#55A868"/>
+<rect x="175.16315789473686" y="318.0" width="27.63157894736842" height="0.0" fill="#C44E52"/>
+<rect x="218.9" y="318.0" width="27.63157894736842" height="0.0" fill="#4C72B0"/>
+<rect x="249.53157894736842" y="318.0" width="27.63157894736842" height="0.0" fill="#55A868"/>
+<rect x="280.16315789473686" y="318.0" width="27.63157894736842" height="0.0" fill="#C44E52"/>
+<rect x="323.9" y="318.0" width="27.63157894736842" height="0.0" fill="#4C72B0"/>
+<rect x="354.5315789473684" y="318.0" width="27.63157894736842" height="0.0" fill="#55A868"/>
+<rect x="385.1631578947368" y="318.0" width="27.63157894736842" height="0.0" fill="#C44E52"/>
+<rect x="428.9" y="318.0" width="27.63157894736842" height="0.0" fill="#4C72B0"/>
+<rect x="459.5315789473684" y="318.0" width="27.63157894736842" height="0.0" fill="#55A868"/>
+<rect x="490.1631578947368" y="318.0" width="27.63157894736842" height="0.0" fill="#C44E52"/>
+<rect x="95.0" y="376.0" width="10" height="10" fill="#4C72B0"/><text x="109.0" y="385.0" font-size="10" fill="#555">1024 B</text>
+<rect x="183.0" y="376.0" width="10" height="10" fill="#55A868"/><text x="197.0" y="385.0" font-size="10" fill="#555">4096 B</text>
+<rect x="271.0" y="376.0" width="10" height="10" fill="#C44E52"/><text x="285.0" y="385.0" font-size="10" fill="#555">65536 B</text>
+</svg>

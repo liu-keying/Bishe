@@ -11,7 +11,7 @@ from pathlib import Path
 
 def _parse_bench_output(text: str) -> dict:
     """
-    Parse stdout of bench_overlay_embed_hls.py.
+    Parse stdout of bench_overlay_embed_hls_scheme_b.py.
     We rely on stable "key=value" tokens in their output lines.
     """
     out: dict[str, str] = {}
@@ -39,7 +39,7 @@ def main() -> int:
         "--mode",
         choices=["embed-hls"],
         default="embed-hls",
-        help="仅支持 embed-hls：调用 bench_overlay_embed_hls.py",
+        help="仅支持 embed-hls：调用 bench_overlay_embed_hls_scheme_b.py",
     )
     p.add_argument("--python", default=sys.executable, help="python 可执行文件路径")
     p.add_argument("--out", default="bench_results.csv", help="输出 CSV 文件名（在 scripts/ 下）")
@@ -56,12 +56,15 @@ def main() -> int:
     p.add_argument("--segments", default=r".\hls_seg*.ts", help="仅 embed-hls：glob")
     p.add_argument("--segments-limits", default="3,9,18", help="仅 embed-hls：逗号分隔，如 3,9,18")
     p.add_argument("--hidden-bytes-list", default="1024,4096,65536", help="逗号分隔，如 1024,4096,65536")
+    p.add_argument("--k", type=int, default=3, help="仅 embed-hls：cipher 分片数 k（k>=1）")
+    p.add_argument("--pad-bytes", type=int, default=0, help="仅 embed-hls：pad_bytes（未携带密文分片尾部伪 TS）")
+    p.add_argument("--g-bytes", type=int, default=0, help="仅 embed-hls：g_bytes（0 表示由 A 自动推导）")
+    p.add_argument("--extract", default="", help="仅 embed-hls：可选 append_marker")
     p.add_argument("--repeats", type=int, default=3, help="每个组合重复次数")
-
     args = p.parse_args()
 
     scripts_dir = Path(__file__).resolve().parent
-    bench = scripts_dir / "bench_overlay_embed_hls.py"
+    bench = scripts_dir / "bench_overlay_embed_hls_scheme_b.py"
     if not bench.is_file():
         raise SystemExit(f"missing: {bench}")
     seg_limits = [int(x) for x in str(args.segments_limits).split(",") if str(x).strip()]
@@ -83,6 +86,11 @@ def main() -> int:
             "segments",
             "segments_bytes",
             "hidden_bytes",
+            "k",
+            "g_bytes",
+            "g_bits",
+            "pad_bytes",
+            "extract",
             "concurrency",
             "duration_s",
             "elapsed_s",
@@ -117,6 +125,10 @@ def main() -> int:
                     "segments_glob": args.segments,
                     "segments_limit": seg_limit,
                     "hidden_bytes": hidden_bytes,
+                    "k": int(args.k),
+                    "pad_bytes": int(args.pad_bytes),
+                    "g_bytes": int(args.g_bytes),
+                    "extract": str(args.extract or ""),
                     "repeat": r + 1,
                 }
                 cmd = [
@@ -136,11 +148,19 @@ def main() -> int:
                     str(args.duration_s),
                     "--hidden-bytes",
                     str(hidden_bytes),
+                    "--k",
+                    str(int(args.k)),
+                    "--pad-bytes",
+                    str(int(args.pad_bytes)),
                     "--drain-timeout-s",
                     str(args.drain_timeout_s),
                     "--idle-s",
                     str(args.idle_s),
                 ]
+                if int(args.g_bytes) > 0:
+                    cmd += ["--g-bytes", str(int(args.g_bytes))]
+                if str(args.extract or "").strip():
+                    cmd += ["--extract", str(args.extract).strip()]
                 t0 = time.time()
                 rc, out = _run_one(cmd)
                 dt = time.time() - t0

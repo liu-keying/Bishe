@@ -7,6 +7,15 @@ from dataclasses import dataclass
 import httpx
 from redis.asyncio import Redis
 
+from .b_reliability import (
+    ReliabilityConfig,
+    clear_frag_watch,
+    delivery_id,
+    post_to_c,
+    register_frag_watch,
+    reliability_watchdog_loop,
+    run_b_control_server,
+)
 from .common import OverlayEnvelope, now_ms
 from .stego import STEGO_METHOD_PSK_HMAC_INPLACE, extract_psk_inplace, extract_trailer
 
@@ -19,6 +28,9 @@ class BWorkerConfig:
     blpop_timeout_s: int = 5
     psk: bytes | None = None
     link_token: str = ""
+    control_host: str = "127.0.0.1"
+    control_port: int = 8011
+    reliability: ReliabilityConfig | None = None
 
 
 ASM_PREFIX = "bishe:overlay:asm:"
@@ -71,6 +83,9 @@ async def forward_one(
     send_ms = now_ms()
     meta = env.meta or {}
     phase = str(meta.get("overlay_phase") or "").strip()
+    # 伪填充分片只随 HLS 出队，不应走默认“整包转发 C”分支（否则会对整段 TS 做 PSK1 误判刷屏）
+    if phase == "pad":
+        return False
 
     if phase == "media":
         chunk_total = int(meta.get("chunk_total") or 1)
@@ -90,7 +105,7 @@ async def forward_one(
         if hls_total > 1 and hls_index < hls_total - 1:
             if chunk_total > 1:
                 raise RuntimeError("中间 HLS 分片不应使用字节分块（chunk_total>1）")
-            # 旧行为：仅最后一片含隐匿；新行为：cipher 分散到多片时，中间片也可能含 trailer
+            # 兼容提示：历史上可能只有最后一片含隐匿；当前实现下中间分片也可能携带密文分片（取决于 A 的 embed 策略）
             if not cipher_group and cipher_k <= 1:
                 logging.info(
                     "HLS 纯媒体分片（无隐匿）已跳过 session=%s seq=%s hls=%d/%d",
@@ -128,7 +143,7 @@ async def forward_one(
 
             cg = str(meta.get("cipher_group") or "").strip()
             ck = int(meta.get("cipher_k") or 0)
-            if cg and ck > 1:
+            if cg and ck >= 1:
                 ci = int(meta.get("cipher_index") or 0)
                 cipher_bytes_real = int(meta.get("cipher_bytes") or 0)
                 if ci < 0 or ci >= ck:
@@ -149,6 +164,17 @@ async def forward_one(
                     await redis.hset(dkey, mapping={str(ci): payload})
                     await redis.expire(dkey, 7200)
                     n_parts = await redis.hlen(dkey)
+                    rcfg = cfg.reliability
+                    if rcfg and rcfg.enabled:
+                        a_url0 = str(meta.get("a_url") or "").strip()
+                        await register_frag_watch(
+                            redis,
+                            session_id=env.session_id,
+                            cipher_group=cg,
+                            cipher_k=ck,
+                            a_url=a_url0,
+                            rcfg=rcfg,
+                        )
                     if n_parts < ck:
                         logging.info(
                             "cipher 分片缓冲 session=%s group=%s… idx=%d/%d hlen=%d",
@@ -159,6 +185,8 @@ async def forward_one(
                             n_parts,
                         )
                         return False
+                    if rcfg and rcfg.enabled:
+                        await clear_frag_watch(redis, session_id=env.session_id, cipher_group=cg)
                     blobs: list[bytes] = []
                     for i in range(ck):
                         b = await redis.hget(dkey, str(i))
@@ -185,17 +213,16 @@ async def forward_one(
                     len(payload),
                 )
             else:
-                # k=1（整包密文在 trailer 中）：也做一次快速校验，避免 MAGIC 撞车导致把随机字节发给 C。
-                if not _looks_like_psk1(payload):
-                    logging.info(
-                        "trailer 提取到非 PSK1 payload，视为误提取并跳过：session=%s seq=%s bytes=%d",
-                        env.session_id,
-                        env.seq,
-                        len(payload),
-                    )
-                    return False
+                # 无 cipher_group：不再支持“仅最后一片 trailer 携带整包密文”的旧路径；这类分片直接跳过。
+                logging.info(
+                    "无 cipher_group，跳过转发：session=%s seq=%s hls=%d/%d",
+                    env.session_id,
+                    env.seq,
+                    hls_index,
+                    hls_total,
+                )
+                return False
 
-            url = f"{c_url.rstrip('/')}/recv"
             ext_hdr = str(meta.get("extract_method") or STEGO_METHOD_PSK_HMAC_INPLACE).strip()
             headers = {
                 "Content-Type": "application/octet-stream",
@@ -209,6 +236,28 @@ async def forward_one(
                 "X-Bishe-HLS-Total": str(hls_total),
                 "X-Bishe-Cipher-Index": str(int(meta.get("cipher_index") or 0)),
             }
+            a_url0 = str(meta.get("a_url") or "").strip()
+            rcfg = cfg.reliability
+            did = delivery_id(env.session_id, cg) if cg else delivery_id(env.session_id, str(env.seq))
+            if rcfg and rcfg.enabled:
+                status, body = await post_to_c(
+                    client,
+                    c_url=c_url,
+                    payload=payload,
+                    headers=headers,
+                    did=did,
+                    redis=redis,
+                    session_id=env.session_id,
+                    cipher_group=cg,
+                    a_url=a_url0,
+                    rcfg=rcfg,
+                )
+                if status == 200:
+                    return True
+                if status == 400:
+                    return False
+                raise RuntimeError(f"C 返回异常: status={status} body={body[:200]}")
+            url = f"{c_url.rstrip('/')}/recv"
             r = await client.post(url, content=payload, headers=headers)
             if r.status_code != 200:
                 raise RuntimeError(f"C 返回异常: status={r.status_code} body={r.text[:200]}")
@@ -274,7 +323,7 @@ async def forward_one(
         # 组装后同样按 overlay meta 走“是否为密文/分片”的筛选与组装逻辑，避免误提取 trailer 直接打到 C。
         cg = str(meta.get("cipher_group") or "").strip()
         ck = int(meta.get("cipher_k") or 0)
-        if cg and ck > 1:
+        if cg and ck >= 1:
             ci = int(meta.get("cipher_index") or 0)
             cipher_bytes_real = int(meta.get("cipher_bytes") or 0)
             if ci < 0 or ci >= ck:
@@ -293,6 +342,17 @@ async def forward_one(
                 await redis.hset(dkey2, mapping={str(ci): payload})
                 await redis.expire(dkey2, 7200)
                 n2 = await redis.hlen(dkey2)
+                rcfg2 = cfg.reliability
+                if rcfg2 and rcfg2.enabled:
+                    a_url2 = str(meta.get("a_url") or "").strip()
+                    await register_frag_watch(
+                        redis,
+                        session_id=sid,
+                        cipher_group=cg,
+                        cipher_k=ck,
+                        a_url=a_url2,
+                        rcfg=rcfg2,
+                    )
                 if n2 < ck:
                     logging.info(
                         "cipher 分片缓冲（chunk-asm 后）session=%s group=%s… idx=%d/%d hlen=%d",
@@ -303,6 +363,8 @@ async def forward_one(
                         n2,
                     )
                     return False
+                if rcfg2 and rcfg2.enabled:
+                    await clear_frag_watch(redis, session_id=sid, cipher_group=cg)
                 blobs2: list[bytes] = []
                 for i in range(ck):
                     b = await redis.hget(dkey2, str(i))
@@ -328,16 +390,14 @@ async def forward_one(
                 len(payload),
             )
         else:
-            if not _looks_like_psk1(payload):
-                logging.info(
-                    "trailer 提取到非 PSK1 payload（chunk-asm 后），视为误提取并跳过：session=%s seq=%s bytes=%d",
-                    sid,
-                    env.seq,
-                    len(payload),
-                )
-                return False
+            logging.info(
+                "无 cipher_group，跳过转发（chunk-asm 后）：session=%s seq=%s bytes=%d",
+                sid,
+                env.seq,
+                len(payload),
+            )
+            return False
 
-        url = f"{c_url.rstrip('/')}/recv"
         hi = int(meta.get("hls_index") or 0)
         ht = int(meta.get("hls_total") or 1)
         ext_hdr2 = str(meta.get("extract_method") or STEGO_METHOD_PSK_HMAC_INPLACE).strip()
@@ -353,6 +413,28 @@ async def forward_one(
             "X-Bishe-HLS-Total": str(ht),
             "X-Bishe-Cipher-Index": str(int(meta.get("cipher_index") or 0)),
         }
+        a_url3 = str(meta.get("a_url") or "").strip()
+        rcfg3 = cfg.reliability
+        did3 = delivery_id(sid, cg) if cg else delivery_id(sid, str(env.seq))
+        if rcfg3 and rcfg3.enabled:
+            status, body = await post_to_c(
+                client,
+                c_url=c_url,
+                payload=payload,
+                headers=headers,
+                did=did3,
+                redis=redis,
+                session_id=sid,
+                cipher_group=cg,
+                a_url=a_url3,
+                rcfg=rcfg3,
+            )
+            if status == 200:
+                return True
+            if status == 400:
+                return False
+            raise RuntimeError(f"C 返回异常: status={status} body={body[:200]}")
+        url = f"{c_url.rstrip('/')}/recv"
         r = await client.post(url, content=payload, headers=headers)
         if r.status_code != 200:
             raise RuntimeError(f"C 返回异常: status={r.status_code} body={r.text[:200]}")
@@ -399,21 +481,45 @@ async def run_b_worker(
     c_base_url: str,
     psk: bytes | None = None,
     link_token: str = "",
+    control_host: str = "127.0.0.1",
+    control_port: int = 8011,
+    reliability: ReliabilityConfig | None = None,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    rcfg = reliability if reliability is not None else ReliabilityConfig()
     cfg = BWorkerConfig(
         redis_url=redis_url,
         queue_key=queue_key,
         c_base_url=c_base_url,
         psk=psk,
         link_token=link_token or "",
+        control_host=control_host,
+        control_port=control_port,
+        reliability=rcfg,
     )
 
     redis = Redis.from_url(redis_url, decode_responses=False)
     await redis.ping()
-    logging.info("B worker 已连接 Redis: %s (queue=%s) -> C=%s", redis_url, queue_key, c_base_url)
+    logging.info(
+        "B worker 已连接 Redis: %s (queue=%s) -> C=%s reliability=%s",
+        redis_url,
+        queue_key,
+        c_base_url,
+        rcfg.enabled,
+    )
 
     async with httpx.AsyncClient(timeout=120.0, verify=False, trust_env=False) as client:
+        control_runner = None
+        watchdog_task = None
+        if rcfg.enabled:
+            control_runner = await run_b_control_server(
+                host=control_host,
+                port=control_port,
+                redis=redis,
+                http_client=client,
+                rcfg=rcfg,
+            )
+            watchdog_task = asyncio.create_task(reliability_watchdog_loop(redis, client, rcfg))
         try:
             while True:
                 item = await redis.blpop(queue_key, timeout=cfg.blpop_timeout_s)
@@ -453,11 +559,19 @@ async def run_b_worker(
                                     env2.seq,
                                     n,
                                 )
-                        else:
+                        elif forwarded:
                             logging.info("转发成功 session=%s seq=%d bytes=%d", env2.session_id, env2.seq, n)
                 except Exception as e:
                     logging.exception("转发失败（丢弃该条）: %r", e)
                     await asyncio.sleep(0.1)
         finally:
+            if watchdog_task:
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
+            if control_runner:
+                await control_runner.cleanup()
             await redis.aclose()
 

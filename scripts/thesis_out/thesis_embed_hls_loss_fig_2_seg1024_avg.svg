@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="580" height="460" font-family="Microsoft YaHei,SimHei,sans-serif" font-size="12">
+<rect width="100%" height="100%" fill="#fafafa"/>
+<rect x="30" y="30" width="520" height="388" fill="white" stroke="#ccc"/>
+<text x="50" y="20" font-size="14" font-weight="bold">小载荷(1024B)：HLS 分片数量 segments_number 与丢包率（对各 k 平均，%）</text>
+<line x1="95.0" y1="318.0" x2="515.0" y2="318.0" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="102.0" x2="515.0" y2="102.0" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="318.0" x2="515.0" y2="318.0" stroke="#222" stroke-width="1.5"/>
+<line x1="95.0" y1="318.0" x2="95.0" y2="102.0" stroke="#222" stroke-width="1.5"/>
+<line x1="95.0" y1="318.0" x2="90.0" y2="318.0" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="322.0" text-anchor="end" font-size="10" fill="#222">0 %</text>
+<line x1="95.0" y1="102.0" x2="90.0" y2="102.0" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="106.0" text-anchor="end" font-size="10" fill="#222">0 %</text>
+<text x="305.0" y="360.0" text-anchor="middle" font-size="11" fill="#222">HLS 分片数量 segments_number / 个</text>
+<line x1="95.0" y1="318.0" x2="95.0" y2="323.0" stroke="#222"/>
+<text x="95.0" y="338.0" text-anchor="middle" font-size="10" fill="#222">6</text>
+<line x1="235.0" y1="318.0" x2="235.0" y2="323.0" stroke="#222"/>
+<text x="235.0" y="338.0" text-anchor="middle" font-size="10" fill="#222">9</text>
+<line x1="375.0" y1="318.0" x2="375.0" y2="323.0" stroke="#222"/>
+<text x="375.0" y="338.0" text-anchor="middle" font-size="10" fill="#222">12</text>
+<line x1="515.0" y1="318.0" x2="515.0" y2="323.0" stroke="#222"/>
+<text x="515.0" y="338.0" text-anchor="middle" font-size="10" fill="#222">15</text>
+<text x="22" y="210.0" text-anchor="middle" font-size="11" fill="#222" transform="rotate(-90 22 210.0)">丢包率 / (%)</text>
+<polyline fill="none" stroke="#C44E52" stroke-width="2.5" points="95.0,318.0 235.0,318.0 375.0,318.0 515.0,318.0"/>
+<circle cx="95.0" cy="318.0" r="5" fill="#C44E52" stroke="white" stroke-width="1"/>
+<circle cx="235.0" cy="318.0" r="5" fill="#C44E52" stroke="white" stroke-width="1"/>
+<circle cx="375.0" cy="318.0" r="5" fill="#C44E52" stroke="white" stroke-width="1"/>
+<circle cx="515.0" cy="318.0" r="5" fill="#C44E52" stroke="white" stroke-width="1"/>
+</svg>

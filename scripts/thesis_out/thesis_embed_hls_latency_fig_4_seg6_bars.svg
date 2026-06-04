@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="620" height="480" font-family="Microsoft YaHei,SimHei,sans-serif" font-size="12">
+<rect width="100%" height="100%" fill="#fafafa"/>
+<rect x="30" y="30" width="520" height="400" fill="white" stroke="#ccc"/>
+<text x="50" y="20" font-size="14" font-weight="bold">固定HLS分片数=6：p50 时延对比</text>
+<line x1="95.0" y1="318.0" x2="515.0" y2="318.0" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="267.02770344317867" x2="515.0" y2="267.02770344317867" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="216.05540688635728" x2="515.0" y2="216.05540688635728" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="165.0831103295359" x2="515.0" y2="165.0831103295359" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="114.11081377271455" x2="515.0" y2="114.11081377271455" stroke="#e8e8e8" stroke-width="1"/>
+<line x1="95.0" y1="318.0" x2="515.0" y2="318.0" stroke="#222" stroke-width="1.5"/>
+<line x1="95.0" y1="318.0" x2="95.0" y2="102.0" stroke="#222" stroke-width="1.5"/>
+<line x1="95.0" y1="318.0" x2="90.0" y2="318.0" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="322.0" text-anchor="end" font-size="10" fill="#222">0 ms</text>
+<line x1="95.0" y1="267.02770344317867" x2="90.0" y2="267.02770344317867" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="271.02770344317867" text-anchor="end" font-size="10" fill="#222">10000 ms</text>
+<line x1="95.0" y1="216.05540688635728" x2="90.0" y2="216.05540688635728" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="220.05540688635728" text-anchor="end" font-size="10" fill="#222">20000 ms</text>
+<line x1="95.0" y1="165.0831103295359" x2="90.0" y2="165.0831103295359" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="169.0831103295359" text-anchor="end" font-size="10" fill="#222">30000 ms</text>
+<line x1="95.0" y1="114.11081377271455" x2="90.0" y2="114.11081377271455" stroke="#222" stroke-width="1"/>
+<text x="87.0" y="118.11081377271455" text-anchor="end" font-size="10" fill="#222">40000 ms</text>
+<text x="305.0" y="360.0" text-anchor="middle" font-size="11" fill="#222">密文分片数 k / 个</text>
+<line x1="147.5" y1="318.0" x2="147.5" y2="323.0" stroke="#222"/>
+<text x="147.5" y="338.0" text-anchor="middle" font-size="10" fill="#222">1</text>
+<line x1="252.5" y1="318.0" x2="252.5" y2="323.0" stroke="#222"/>
+<text x="252.5" y="338.0" text-anchor="middle" font-size="10" fill="#222">2</text>
+<line x1="357.5" y1="318.0" x2="357.5" y2="323.0" stroke="#222"/>
+<text x="357.5" y="338.0" text-anchor="middle" font-size="10" fill="#222">3</text>
+<line x1="462.5" y1="318.0" x2="462.5" y2="323.0" stroke="#222"/>
+<text x="462.5" y="338.0" text-anchor="middle" font-size="10" fill="#222">5</text>
+<text x="22" y="210.0" text-anchor="middle" font-size="11" fill="#222" transform="rotate(-90 22 210.0)">p50 时延 / (ms)</text>
+<rect x="113.9" y="200.41030999651693" width="27.63157894736842" height="117.58969000348307" fill="#4C72B0"/>
+<rect x="144.53157894736842" y="207.10297253442755" width="27.63157894736842" height="110.89702746557245" fill="#55A868"/>
+<rect x="175.16315789473686" y="154.99909099404476" width="27.63157894736842" height="163.00090900595524" fill="#C44E52"/>
+<rect x="218.9" y="207.70444563379806" width="27.63157894736842" height="110.29555436620194" fill="#4C72B0"/>
+<rect x="249.53157894736842" y="203.84754186099855" width="27.63157894736842" height="114.15245813900145" fill="#55A868"/>
+<rect x="280.16315789473686" y="216.8420793298842" width="27.63157894736842" height="101.1579206701158" fill="#C44E52"/>
+<rect x="323.9" y="204.2400285444861" width="27.63157894736842" height="113.75997145551389" fill="#4C72B0"/>
+<rect x="354.5315789473684" y="118.00000000000003" width="27.63157894736842" height="199.99999999999997" fill="#55A868"/>
+<rect x="385.1631578947368" y="197.2755137582724" width="27.63157894736842" height="120.72448624172759" fill="#C44E52"/>
+<rect x="428.9" y="203.74729634443682" width="27.63157894736842" height="114.25270365556318" fill="#4C72B0"/>
+<rect x="459.5315789473684" y="144.5837517309343" width="27.63157894736842" height="173.4162482690657" fill="#55A868"/>
+<rect x="490.1631578947368" y="193.79070775033773" width="27.63157894736842" height="124.20929224966227" fill="#C44E52"/>
+<rect x="95.0" y="376.0" width="10" height="10" fill="#4C72B0"/><text x="109.0" y="385.0" font-size="10" fill="#555">1024 B</text>
+<rect x="183.0" y="376.0" width="10" height="10" fill="#55A868"/><text x="197.0" y="385.0" font-size="10" fill="#555">4096 B</text>
+<rect x="271.0" y="376.0" width="10" height="10" fill="#C44E52"/><text x="285.0" y="385.0" font-size="10" fill="#555">65536 B</text>
+</svg>

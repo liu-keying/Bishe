@@ -110,8 +110,29 @@ python main.py c --host 127.0.0.1 --port 8443 --ssl-cert cert.pem --ssl-key key.
 python main.py b-worker --c-url https://127.0.0.1:8443 ...
 ```
 
+## 可靠性（C 回执 / B 超时重发 / 分片超时通知 A）
+
+启用后需同时配置 **B 控制面** 与 **C 回执 URL**：
+
+```powershell
+# B-worker（控制面默认 8011）
+python main.py b-worker --c-url http://127.0.0.1:8002 --control-port 8011
+
+# C 须指向 B 的 recv-ack
+python main.py c --port 8002 --psk-hex <64hex> --b-callback-url http://127.0.0.1:8011/overlay/recv-ack
+```
+
+行为概要：
+
+- **C AEAD 解密失败**：`POST /overlay/recv-ack`（`ok=false`）→ B 调 A `/overlay/error-notice` 重入队媒体。
+- **C 解密成功**：`ok=true` 回执 → B 清除 pending。
+- **B 超时未收到回执**：按 `--c-ack-timeout-s` 重发 `POST /recv`（最多 `--c-resend-max` 次），仍失败则通知 A。
+- **B 超时未收齐 k 个密文分片**：按 `--frag-assembly-timeout-s` 通知 A 重传。
+
+关闭：`python main.py b-worker --no-reliability`（C 可不设 `--b-callback-url`）。
+
 ## 后续扩展（建议）
 
 - 调整 `b-pull` 轮询与分片大小，使 TLS 外可见的时序/体积更接近真实拉片。
 - 多段 fMP4、真实 m3u8 索引与 GET 组合。
-- Redis Streams、多 worker、重试与幂等。
+- Redis Streams、多 worker、幂等（部分已由可靠性模块覆盖）。

@@ -28,17 +28,73 @@ def _percentile(sorted_vals: list[float], p: float) -> float | None:
     return float(sorted_vals[k - 1])
 
 
+async def _notify_b_recv_ack(
+    app: web.Application,
+    *,
+    delivery_id: str,
+    ok: bool,
+    session_id: str,
+    reason: str = "",
+    detail: str = "",
+) -> None:
+    b_url = str(app.get("b_callback_url") or "").strip()
+    if not b_url:
+        return
+    body = {
+        "delivery_id": delivery_id,
+        "ok": ok,
+        "session_id": session_id,
+        "reason": reason,
+        "detail": detail,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0, verify=False, trust_env=False) as client:
+            await client.post(b_url, json=body, headers={"X-Overlay": "1"})
+    except Exception:
+        logging.exception("C -> B recv-ack 失败 delivery_id=%s ok=%s", delivery_id, ok)
+
+
 async def handle_recv(request: web.Request) -> web.Response:
     payload = await request.read()
     psk: bytes | None = request.app.get("psk")
     if psk is None:
         return web.json_response({"ok": False, "error": "PSK not ready (start C with --e-url and wait kex)"}, status=503)
 
+    delivery_id_hdr = str(request.headers.get("X-Delivery-Id", "") or "").strip()
+    session_id_hdr = str(request.headers.get("X-Session", "") or "")
+
+    delivered: set[str] = request.app.setdefault("delivered_ids", set())
+    if delivery_id_hdr and delivery_id_hdr in delivered:
+        if delivery_id_hdr:
+            asyncio.create_task(
+                _notify_b_recv_ack(
+                    request.app,
+                    delivery_id=delivery_id_hdr,
+                    ok=True,
+                    session_id=session_id_hdr,
+                    reason="duplicate_delivery",
+                )
+            )
+        return web.json_response(
+            {"ok": True, "duplicate": True, "delivery_id": delivery_id_hdr},
+            status=200,
+        )
+
     try:
-        session_id_hdr = str(request.headers.get("X-Session", "") or "")
         aad = session_id_hdr.encode("utf-8")
         payload = decrypt_hidden(psk=psk, payload=payload, aad=aad)
     except Exception as e:
+        if delivery_id_hdr:
+            asyncio.create_task(
+                _notify_b_recv_ack(
+                    request.app,
+                    delivery_id=delivery_id_hdr,
+                    ok=False,
+                    session_id=session_id_hdr,
+                    reason="decrypt_failed",
+                    detail=repr(e),
+                )
+            )
         return web.json_response({"ok": False, "error": f"decrypt failed: {e!r}"}, status=400)
 
     t0_ms = int(request.headers.get("X-T0-MS", "0") or "0")
@@ -77,6 +133,18 @@ async def handle_recv(request: web.Request) -> web.Response:
         e2e_ms,
         b2c_ms,
     )
+
+    if delivery_id_hdr:
+        delivered.add(delivery_id_hdr)
+        asyncio.create_task(
+            _notify_b_recv_ack(
+                request.app,
+                delivery_id=delivery_id_hdr,
+                ok=True,
+                session_id=session_id,
+                reason="ok",
+            )
+        )
 
     return web.json_response(
         {
@@ -141,6 +209,7 @@ async def handle_stats(request: web.Request) -> web.Response:
 
 async def handle_reset_stats(request: web.Request) -> web.Response:
     request.app["stats"] = {"start_ms": now_ms(), "recv_count": 0, "dup_count": 0, "recv_bytes": 0, "events": [], "seen_msg_ids": set()}
+    request.app["delivered_ids"] = set()
     return web.json_response({"ok": True})
 
 
@@ -162,6 +231,8 @@ async def run_c_server(
     e_url: str = "",
     a_url: str = "",
     b_gate_url: str = "",
+    psk_hex: str = "",
+    b_callback_url: str = "",
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -170,11 +241,22 @@ async def run_c_server(
     app["stats"] = {"start_ms": now_ms(), "recv_count": 0, "dup_count": 0, "recv_bytes": 0, "events": [], "seen_msg_ids": set()}
     app["psk"] = None
     app["link_token"] = ""
+    app["b_callback_url"] = (b_callback_url or "").strip()
+    if app["b_callback_url"]:
+        logging.info("C 启用 B 回执: %s", app["b_callback_url"])
+
+    psk_hex2 = (psk_hex or "").strip()
+    if psk_hex2:
+        if len(psk_hex2) != 64:
+            raise SystemExit("--psk-hex 须为 64 位十六进制（32 字节 AES-256 密钥）")
+        app["psk"] = bytes.fromhex(psk_hex2)
+        logging.info("C 使用静态 PSK（--psk-hex / BISHE_PSK_HEX）")
 
     e_url2 = (e_url or "").strip()
     a_url2 = (a_url or "").strip()
     if e_url2 and a_url2:
-        c_base = f"http://{host}:{port}"
+        scheme = "https" if ssl_certfile and ssl_keyfile else "http"
+        c_base = f"{scheme}://{host}:{port}"
         priv, pub = generate_rsa_keypair(bits=2048)
         pub_b64 = b64e(rsa_pub_to_pem(pub))
         link = f"{a_url2.rstrip('/')}|{c_base.rstrip('/')}|{STEGO_METHOD_PSK_HMAC_INPLACE}"

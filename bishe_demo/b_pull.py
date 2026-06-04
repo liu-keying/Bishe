@@ -19,6 +19,7 @@ class BPullConfig:
     redis_url: str
     queue_key: str
     poll_interval_s: float
+    segment_interval_s: float = 0.0
 
 
 def _envelope_from_get_response(r: httpx.Response, fallback_session: str, a_base_url: str) -> OverlayEnvelope:
@@ -107,6 +108,7 @@ async def run_b_pull(
     redis_url: str,
     queue_key: str,
     poll_interval_s: float = 0.25,
+    segment_interval_s: float = 0.0,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = BPullConfig(
@@ -115,16 +117,20 @@ async def run_b_pull(
         redis_url=redis_url,
         queue_key=queue_key,
         poll_interval_s=poll_interval_s,
+        segment_interval_s=max(0.0, float(segment_interval_s)),
     )
 
     redis = Redis.from_url(redis_url, decode_responses=False)
     await redis.ping()
     live_session = [cfg.session_id]
     master_url = f"{cfg.a_base_url}{make_hls_master_path(live_session[0])}"
+    seg_iv = cfg.segment_interval_s
     logging.info(
-        "B pull 启动(类 HLS 客户端): master=%s -> index.m3u8 -> seg-*.ts -> Redis %s",
+        "B pull 启动(类 HLS 客户端): master=%s -> index.m3u8 -> seg-*.ts -> Redis %s "
+        "(segment_interval_s=%s)",
         master_url,
         cfg.queue_key,
+        seg_iv if seg_iv > 0 else "burst",
     )
 
     media_playlist_url: str | None = None
@@ -168,7 +174,9 @@ async def run_b_pull(
 
                 logging.info("index.m3u8 解析到 %d 个分片 URI，将顺序 GET", len(seg_urls))
                 saw_next_session = False
-                for seg_url in seg_urls:
+                for seg_i, seg_url in enumerate(seg_urls):
+                    if cfg.segment_interval_s > 0 and seg_i > 0:
+                        await asyncio.sleep(cfg.segment_interval_s)
                     try:
                         rs = await client.get(seg_url)
                     except httpx.HTTPError as e:

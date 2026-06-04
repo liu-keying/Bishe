@@ -6,6 +6,7 @@ from bishe_demo.a_client_proxy import run_a_proxy
 from bishe_demo.b_gate_pull import env_token_secret as b_gate_env_secret
 from bishe_demo.b_gate_pull import run_b_gate_pull
 from bishe_demo.b_pull import run_b_pull
+from bishe_demo.b_reliability import ReliabilityConfig
 from bishe_demo.b_worker import run_b_worker
 from bishe_demo.c_server import run_c_server
 from bishe_demo.e_server import env_token_secret as e_env_secret
@@ -47,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=float(os.environ.get("BISHE_POLL_INTERVAL", "0.25")),
         help="b-pull 在 404 无分片时的轮询间隔(秒)",
     )
+    p.add_argument(
+        "--segment-interval",
+        type=float,
+        default=float(os.environ.get("BISHE_SEGMENT_INTERVAL", "0")),
+        help="b-pull 相邻分片 GET 间隔(秒)；0=就绪后突发连拉(默认/压测)",
+    )
 
     p.add_argument("--c-url", default=os.environ.get("BISHE_C_URL", "http://127.0.0.1:8002"))
     p.add_argument(
@@ -69,6 +76,50 @@ def build_parser() -> argparse.ArgumentParser:
         "--ssl-key",
         default=os.environ.get("BISHE_C_SSL_KEY", ""),
         help="C 启用 HTTPS 时的私钥路径",
+    )
+    p.add_argument(
+        "--psk-hex",
+        default=os.environ.get("BISHE_PSK_HEX", ""),
+        help="C 静态 PSK（64 hex）；对比实验时可与 Zhang 发送端共用，无需 E",
+    )
+    p.add_argument(
+        "--b-callback-url",
+        default=os.environ.get("BISHE_B_CALLBACK_URL", ""),
+        help="C 解密后 POST 回执到 B：如 http://127.0.0.1:8011/overlay/recv-ack",
+    )
+    p.add_argument(
+        "--control-host",
+        default=os.environ.get("BISHE_CONTROL_HOST", "127.0.0.1"),
+        help="b-worker 可靠性控制面监听地址",
+    )
+    p.add_argument(
+        "--control-port",
+        type=int,
+        default=int(os.environ.get("BISHE_CONTROL_PORT", "8011")),
+        help="b-worker 可靠性控制面端口（recv-ack）",
+    )
+    p.add_argument(
+        "--no-reliability",
+        action="store_true",
+        help="关闭 C 回执、B 超时重发与分片组装超时通知 A",
+    )
+    p.add_argument(
+        "--c-ack-timeout-s",
+        type=float,
+        default=float(os.environ.get("BISHE_C_ACK_TIMEOUT_S", "30")),
+        help="B 等待 C 回执超时后重发 POST /recv 的间隔(秒)",
+    )
+    p.add_argument(
+        "--frag-assembly-timeout-s",
+        type=float,
+        default=float(os.environ.get("BISHE_FRAG_ASSEMBLY_TIMEOUT_S", "120")),
+        help="B 收不齐 k 个密文分片后通知 A 重传(秒)",
+    )
+    p.add_argument(
+        "--c-resend-max",
+        type=int,
+        default=int(os.environ.get("BISHE_C_RESEND_MAX", "3")),
+        help="B 向 C 重发 /recv 的最大次数",
     )
     return p
 
@@ -94,21 +145,45 @@ async def _amain() -> None:
             redis_url=args.redis,
             queue_key=args.queue,
             poll_interval_s=args.poll_interval,
+            segment_interval_s=float(args.segment_interval),
         )
         return
     if args.role == "b-gate":
         secret = (args.token_secret or "").strip() or b_gate_env_secret()
+        rcfg_gate = ReliabilityConfig(
+            enabled=not args.no_reliability,
+            c_ack_timeout_s=float(args.c_ack_timeout_s),
+            c_resend_max=int(args.c_resend_max),
+            frag_assembly_timeout_s=float(args.frag_assembly_timeout_s),
+        )
         await run_b_gate_pull(
             host=args.host,
             port=args.port,
             redis_url=args.redis,
             queue_key=args.queue,
             poll_interval_s=args.poll_interval,
+            segment_interval_s=float(args.segment_interval),
             token_secret=secret,
+            control_host=args.control_host,
+            control_port=int(args.control_port),
+            reliability=rcfg_gate,
         )
         return
     if args.role == "b-worker":
-        await run_b_worker(redis_url=args.redis, queue_key=args.queue, c_base_url=args.c_url)
+        rcfg = ReliabilityConfig(
+            enabled=not args.no_reliability,
+            c_ack_timeout_s=float(args.c_ack_timeout_s),
+            c_resend_max=int(args.c_resend_max),
+            frag_assembly_timeout_s=float(args.frag_assembly_timeout_s),
+        )
+        await run_b_worker(
+            redis_url=args.redis,
+            queue_key=args.queue,
+            c_base_url=args.c_url,
+            control_host=args.control_host,
+            control_port=int(args.control_port),
+            reliability=rcfg,
+        )
         return
     if args.role == "c":
         cert = (args.ssl_cert or "").strip() or None
@@ -121,6 +196,8 @@ async def _amain() -> None:
             e_url=(args.e_url or "").strip(),
             a_url=(args.a_url or "").strip(),
             b_gate_url=(args.b_gate_url or "").strip(),
+            psk_hex=(args.psk_hex or "").strip(),
+            b_callback_url=(args.b_callback_url or "").strip(),
         )
         return
     if args.role == "e":

@@ -43,7 +43,7 @@ def main() -> int:
     p.add_argument("--hidden", required=True, help="隐匿文件路径")
     p.add_argument("--a-url", default="http://127.0.0.1:8000", help="A 根地址")
     p.add_argument("--c-url", default="", help="可选，查询参数 c=")
-    p.add_argument("--k", type=int, default=3, help="密文分片数（k>=2 才是方案 B）")
+    p.add_argument("--k", type=int, default=3, help="密文分片数（k>=1）")
     p.add_argument("--g-bytes", type=int, default=0, help="每份密文分片大小（bytes）。0=由 A 自动按密文均分推导")
     p.add_argument("--g-bits", type=int, default=0, help="每份密文分片大小（bits）。优先级低于 --g-bytes")
     p.add_argument("--pad-bytes", type=int, default=0, help="可选：pad_bytes=（未携带密文的 TS 尾部追加伪 TS 字节）")
@@ -63,8 +63,8 @@ def main() -> int:
             print("当前工作目录:", os.getcwd(), file=sys.stderr)
             return 1
 
-    if args.k < 2:
-        print("--k 必须 >= 2 才是方案 B（否则请用 publish_embed_hls.py 或 k=1）", file=sys.stderr)
+    if args.k < 1:
+        print("--k 必须 >= 1", file=sys.stderr)
         return 1
     if args.k > len(paths):
         print(f"--k 不能大于分片数（k={args.k}, segments={len(paths)}）", file=sys.stderr)

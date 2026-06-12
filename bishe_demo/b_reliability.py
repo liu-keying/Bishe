@@ -114,6 +114,7 @@ async def register_pending_c_delivery(
     payload: bytes,
     headers: dict[str, str],
     rcfg: ReliabilityConfig,
+    recv_endpoint: str = "/recv",
 ) -> None:
     if not rcfg.enabled:
         return
@@ -129,6 +130,7 @@ async def register_pending_c_delivery(
         "last_send_ms": now_ms(),
         "acked": False,
         "http_ok": False,
+        "recv_endpoint": recv_endpoint,
     }
     ttl = int(max(rcfg.c_ack_timeout_s, rcfg.frag_assembly_timeout_s) * rcfg.c_resend_max) + 120
     await redis.set(_pending_key(did), json.dumps(doc, ensure_ascii=False).encode("utf-8"), ex=ttl)
@@ -146,9 +148,10 @@ async def post_to_c(
     cipher_group: str,
     a_url: str,
     rcfg: ReliabilityConfig,
+    recv_endpoint: str = "/recv",
 ) -> tuple[int, str]:
     hdrs = {**headers, "X-Delivery-Id": did}
-    url = f"{c_url.rstrip('/')}/recv"
+    url = f"{c_url.rstrip('/')}{recv_endpoint}"
     if rcfg.enabled:
         await register_pending_c_delivery(
             redis,
@@ -270,7 +273,7 @@ async def _resend_pending(
     payload = base64.b64decode(str(doc["payload_b64"]).encode("ascii"))
     headers = dict(doc.get("headers") or {})
     c_url = str(doc["c_url"])
-    url = f"{c_url.rstrip('/')}/recv"
+    url = f"{c_url.rstrip('/')}{doc.get('recv_endpoint') or '/recv'}"
     attempt += 1
     doc["attempt"] = attempt
     doc["last_send_ms"] = now_ms()

@@ -5,6 +5,8 @@ import logging
 import os
 import random
 import re
+import struct
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
@@ -14,13 +16,15 @@ from aiohttp import web
 
 from .common import now_ms
 from .crypto_box import aead_decrypt, b64d, b64e, generate_rsa_keypair, rsa_oaep_unwrap, rsa_pub_to_pem
-from .psk_aead import encrypt_hidden
+from .hls_shared import register_hls_routes, setup_hls_state
+from .psk_aead import decrypt_hidden, encrypt_hidden
 from .stego import (
     STEGO_METHOD_PSK_HMAC_INPLACE,
     STEGO_TAG_LEN,
     embed_pad_inplace,
     embed_psk_inplace,
 )
+from .tunnel import CTL_CONNECT, CTL_CONNECTED, CTL_ERROR, CTL_FIN, TunnelCtl, TunnelData
 
 
 @dataclass
@@ -530,6 +534,286 @@ async def handle_error_notice(request: web.Request) -> web.Response:
     )
 
 
+# ---------------------------------------------------------------------------
+# SOCKS5 隧道 —— A 侧（入口代理 + 反向接收）
+# ---------------------------------------------------------------------------
+
+async def handle_recv_tunnel(request: web.Request) -> web.Response:
+    """接收 B-gate 回传的隧道消息（TunnelCtl / TunnelData），写入对应客户端连接。"""
+    payload = await request.read()
+    psk: bytes | None = request.app.get("psk")
+    if psk is None:
+        return web.json_response({"ok": False, "error": "PSK not ready"}, status=503)
+
+    session_id_hdr = str(request.headers.get("X-Session", "") or "")
+    try:
+        aad = session_id_hdr.encode("utf-8")
+        plain = decrypt_hidden(psk=psk, payload=payload, aad=aad)
+    except Exception as e:
+        return web.json_response({"ok": False, "error": f"decrypt failed: {e!r}"}, status=400)
+
+    # 判断消息类型
+    ctl = TunnelCtl.from_bytes(plain)
+    if ctl is not None:
+        tunnel_conns: dict = request.app.get("tunnel_conns") or {}
+        st = tunnel_conns.get(ctl.conn_id)
+        if st is None:
+            return web.json_response({"ok": True, "unknown_conn": ctl.conn_id[:16]})
+
+        if ctl.ctl_type == CTL_CONNECTED:
+            st["ready"].set()
+            logging.info("SOCKS5 隧道已建立: conn=%s", ctl.conn_id[:8])
+        elif ctl.ctl_type in (CTL_FIN, CTL_ERROR):
+            logging.info("SOCKS5 隧道关闭: conn=%s ctl=%s", ctl.conn_id[:8], ctl.ctl_type)
+            try:
+                st["writer"].close()
+            except Exception:
+                pass
+            tunnel_conns.pop(ctl.conn_id, None)
+        return web.json_response({"ok": True, "conn_id": ctl.conn_id, "ctl": ctl.ctl_type})
+
+    data_msg = TunnelData.from_bytes(plain)
+    if data_msg is not None:
+        tunnel_conns: dict = request.app.get("tunnel_conns") or {}
+        st = tunnel_conns.get(data_msg.conn_id)
+        if st is None:
+            return web.json_response({"ok": True, "unknown_conn": data_msg.conn_id[:16]})
+        try:
+            st["writer"].write(data_msg.data)
+            await st["writer"].drain()
+            st["last_active"] = time.time()
+        except Exception:
+            tunnel_conns.pop(data_msg.conn_id, None)
+            return web.json_response({"ok": True, "conn_closed": data_msg.conn_id[:16]})
+        return web.json_response({"ok": True, "conn_id": data_msg.conn_id, "bytes": len(data_msg.data)})
+
+    return web.json_response({"ok": False, "error": "unknown tunnel message format"}, status=400)
+
+
+def _embed_tunnel_msg(app: web.Application, payload: bytes, *, is_ctl: bool = False) -> None:
+    """将隧道消息加密后嵌入 A 的 HLS 分片队列。"""
+    psk: bytes | None = app.get("psk")
+    if psk is None:
+        logging.warning("SOCKS5: PSK 未就绪，丢弃隧道消息")
+        return
+    session_id = str(app.get("session_id") or "")
+    aad = session_id.encode("utf-8")
+    hidden = encrypt_hidden(psk=psk, hidden=payload, aad=aad)
+
+    # 分割为适合 TS 分片的大小（默认 32KB 以下不用切分）
+    orig_len = len(hidden)  # 记录原始 AEAD 密文长度（截断用）
+    g_bytes = max(32768, len(hidden))
+    if len(hidden) < g_bytes:
+        hidden = hidden + os.urandom(g_bytes - len(hidden))
+
+    part = hidden[:g_bytes]
+    link_token = str(app.get("link_token") or "").strip()
+    if not link_token:
+        logging.warning("SOCKS5: link_token 未就绪，丢弃隧道消息")
+        return
+
+    seq = int(app.get("seq") or 1)
+    app["seq"] = seq + 1
+    emit_sess = str(app.get("session_id") or "")
+
+    try:
+        blob = embed_psk_inplace(
+            b"\x00" * (g_bytes + STEGO_TAG_LEN),  # 占位分片，须 >= STEGO_TAG_LEN + cipher_fragment
+            token=link_token,
+            hls_index=0,
+            frag_idx=0,
+            cipher_fragment=part,
+        )
+    except Exception as e:
+        logging.warning("SOCKS5: embed 失败: %r", e)
+        return
+
+    job = PendingPullJob(
+        seq=seq,
+        t0_ms=0,
+        c_url="",
+        ua="socks5",
+        a_recv_ms=0,
+        content_type="application/octet-stream",
+        blob=blob,
+        emit_session=emit_sess,
+        hls_index=0,
+        hls_total=1,
+        cipher_group=uuid.uuid4().hex,  # 必须非空，worker 才处理
+        cipher_k=1,
+        cipher_index=0,
+        cipher_bytes=orig_len,  # 原始 AEAD 长度（不含填充），worker 据此截断
+        overlay_phase="media",
+        stego_frag_body_len=g_bytes,
+    )
+    app["pull_queue"].append(job)
+    logging.debug("SOCKS5: 隧道消息已入 HLS 队列 seq=%d bytes=%d", seq, len(hidden))
+
+
+async def handle_socks_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    app: web.Application,
+    cfg: dict,
+) -> None:
+    """处理单个 SOCKS5 客户端连接。"""
+    peer = writer.get_extra_info("peername")
+    logging.info("SOCKS5 新连接: %s", peer)
+    conn_id = ""
+    tunnel_conns: dict = app.get("tunnel_conns") or {}
+
+    async def _send_tunnel_ctl(ctl_type: str, host: str = "", port: int = 0) -> str:
+        cid = conn_id or uuid.uuid4().hex
+        ctl = TunnelCtl(conn_id=cid, ctl_type=ctl_type, host=host, port=port)
+        _embed_tunnel_msg(app, ctl.to_bytes(), is_ctl=True)
+        return cid
+
+    try:
+        # --- SOCKS5 握手阶段 1: 认证协商 ---
+        auth_req = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
+        if auth_req[0] != 0x05:
+            writer.close()
+            return
+        nmethods = auth_req[1]
+        await asyncio.wait_for(reader.readexactly(nmethods), timeout=5.0)
+        writer.write(b"\x05\x00")  # 选择无认证
+        await writer.drain()
+
+        # --- SOCKS5 握手阶段 2: 连接请求 ---
+        req_hdr = await asyncio.wait_for(reader.readexactly(4), timeout=10.0)
+        if req_hdr[0] != 0x05 or req_hdr[1] != 0x01:  # 只支持 CONNECT
+            writer.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")  # 命令不支持
+            await writer.drain()
+            writer.close()
+            return
+
+        atyp = req_hdr[3]
+        host: str
+        if atyp == 0x01:  # IPv4
+            addr = await asyncio.wait_for(reader.readexactly(4), timeout=5.0)
+            host = ".".join(str(b) for b in addr)
+        elif atyp == 0x03:  # 域名
+            len_byte = await asyncio.wait_for(reader.readexactly(1), timeout=5.0)
+            name = await asyncio.wait_for(reader.readexactly(len_byte[0]), timeout=5.0)
+            host = name.decode("ascii", errors="replace")
+        elif atyp == 0x04:  # IPv6
+            addr = await asyncio.wait_for(reader.readexactly(16), timeout=5.0)
+            host = ":".join(f"{addr[i]<<8|addr[i+1]:x}" for i in range(0, 16, 2))
+        else:
+            writer.write(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")  # 地址类型不支持
+            await writer.drain()
+            writer.close()
+            return
+
+        port_bytes = await asyncio.wait_for(reader.readexactly(2), timeout=5.0)
+        port = struct.unpack(">H", port_bytes)[0]
+        logging.info("SOCKS5 CONNECT: %s:%d", host, port)
+
+        # 生成连接 ID，通过隐匿通道请求 C 建连
+        conn_id = uuid.uuid4().hex
+        ready_event = asyncio.Event()
+        st = {
+            "reader": reader,
+            "writer": writer,
+            "ready": ready_event,
+            "target_host": host,
+            "target_port": port,
+            "created_at": time.time(),
+            "last_active": time.time(),
+        }
+        tunnel_conns[conn_id] = st
+        app["tunnel_conns"] = tunnel_conns
+
+        await _send_tunnel_ctl(CTL_CONNECT, host=host, port=port)
+
+        # 等待 C 确认建连
+        try:
+            await asyncio.wait_for(ready_event.wait(), timeout=cfg.get("connect_timeout", 30.0))
+        except asyncio.TimeoutError:
+            logging.warning("SOCKS5: 等待 C 建连超时 conn=%s", conn_id[:8])
+            writer.write(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")  # 主机不可达
+            await writer.drain()
+            writer.close()
+            tunnel_conns.pop(conn_id, None)
+            await _send_tunnel_ctl(CTL_FIN)
+            return
+
+        # 回 SOCKS5 成功响应
+        writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        await writer.drain()
+        logging.info("SOCKS5 隧道就绪: conn=%s → %s:%d", conn_id[:8], host, port)
+
+        # --- 阶段 3: 数据转发（客户端 → 隐匿通道） ---
+        buffer_size = cfg.get("buffer_size", 32768)
+        seq = 0
+        while True:
+            try:
+                data = await asyncio.wait_for(reader.read(buffer_size), timeout=0.1)
+            except asyncio.TimeoutError:
+                # 检查连接是否还在
+                if conn_id not in tunnel_conns:
+                    break
+                continue
+            except Exception:
+                break
+
+            if not data:
+                # 客户端断开
+                break
+
+            seq += 1
+            td = TunnelData(conn_id=conn_id, seq=seq, data=data)
+            _embed_tunnel_msg(app, td.to_bytes())
+            st["last_active"] = time.time()
+
+    except Exception as e:
+        logging.warning("SOCKS5 客户端异常 conn=%s: %r", conn_id[:8] if conn_id else "?", e)
+    finally:
+        if conn_id and conn_id in tunnel_conns:
+            tunnel_conns.pop(conn_id, None)
+        try:
+            writer.close()
+        except Exception:
+            pass
+        if conn_id:
+            await _send_tunnel_ctl(CTL_FIN)
+            logging.info("SOCKS5 客户端断开: conn=%s", conn_id[:8])
+
+
+async def run_socks_listener(app: web.Application, host: str, port: int, cfg: dict) -> asyncio.AbstractServer:
+    """启动 SOCKS5 监听器。"""
+    async def _client_connected(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        await handle_socks_client(reader, writer, app, cfg)
+
+    server = await asyncio.start_server(_client_connected, host=host, port=port)
+    logging.info("SOCKS5 代理监听: %s:%d", host, port)
+    return server
+
+
+async def _tunnel_cleanup_loop(app: web.Application, idle_timeout_s: float = 300.0) -> None:
+    """定期清理空闲/过期的隧道连接。"""
+    while True:
+        await asyncio.sleep(30)
+        tunnel_conns: dict = app.get("tunnel_conns") or {}
+        now = time.time()
+        to_remove = []
+        for conn_id, st in list(tunnel_conns.items()):
+            last = st.get("last_active", st.get("created_at", now))
+            if now - last > idle_timeout_s:
+                to_remove.append(conn_id)
+        for conn_id in to_remove:
+            st = tunnel_conns.pop(conn_id, None)
+            if st:
+                try:
+                    st["writer"].close()
+                except Exception:
+                    pass
+                # 通知 C 关闭
+                ctl = TunnelCtl(conn_id=conn_id, ctl_type=CTL_FIN)
+                _embed_tunnel_msg(app, ctl.to_bytes(), is_ctl=True)
+                logging.info("SOCKS5 空闲超时关闭: conn=%s", conn_id[:8])
+
+
 async def run_a_proxy(
     *,
     host: str,
@@ -538,19 +822,21 @@ async def run_a_proxy(
     e_url: str = "",
     c_url: str = "",
     b_gate_url: str = "",
+    socks_host: str = "127.0.0.1",
+    socks_port: int = 0,
+    socks_enabled: bool = False,
+    socks_buffer_size: int = 32768,
+    socks_connect_timeout: float = 30.0,
+    socks_idle_timeout: float = 300.0,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     app = web.Application(client_max_size=256 * 1024 * 1024)
-    seq0 = parse_initial_session_seq(session_id)
-    app["session_seq"] = seq0
-    app["session_id"] = f"bishe-{seq0}"
-    app["session_next"] = {}
-    app["seq"] = 1
-    app["pull_queue"] = deque[PendingPullJob]()
-    app["retry_media"] = []
+    setup_hls_state(app, session_id or "bishe-1")
     app["psk"] = None
     app["link_token"] = ""
+    app["tunnel_conns"] = {}
+    app["socks_enabled"] = socks_enabled
 
     e_url2 = (e_url or "").strip()
     c_url2 = (c_url or "").strip()
@@ -612,9 +898,10 @@ async def run_a_proxy(
     app.router.add_post("/overlay/stop-notice", handle_stop_notice)
     app.router.add_post("/overlay/error-notice", handle_error_notice)
     app.router.add_post("/overlay/embed-hls", handle_overlay_embed_hls)
-    app.router.add_get("/hls/{session_id}/master.m3u8", handle_hls_master)
-    app.router.add_get("/hls/{session_id}/index.m3u8", handle_hls_playlist)
-    app.router.add_get("/hls/{session_id}/seg-{seg}.ts", handle_hls_segment)
+    # SOCKS5 反向通道接收端点
+    app.router.add_post("/overlay/recv-tunnel", handle_recv_tunnel)
+    # HLS 路由（正向）
+    register_hls_routes(app, "/hls")
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -627,5 +914,20 @@ async def run_a_proxy(
     )
     await site.start()
 
-    while True:
-        await asyncio.sleep(3600)
+    # SOCKS5 监听器
+    socks_server = None
+    if socks_enabled and socks_port > 0:
+        socks_cfg = {
+            "buffer_size": socks_buffer_size,
+            "connect_timeout": socks_connect_timeout,
+        }
+        socks_server = await run_socks_listener(app, socks_host, socks_port, socks_cfg)
+        asyncio.create_task(_tunnel_cleanup_loop(app, idle_timeout_s=socks_idle_timeout))
+
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        if socks_server:
+            socks_server.close()
+            await socks_server.wait_closed()

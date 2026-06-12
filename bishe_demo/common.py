@@ -19,7 +19,7 @@ def new_session_id() -> str:
 @dataclass(frozen=True)
 class OverlayEnvelope:
     """
-    把“消息”伪装成“媒体分片/上传请求”的载体。
+    把"消息"伪装成"媒体分片/上传请求"的载体。
 
     - payload_b64：真实要传的字节内容（demo 用 base64；后续你可换成更贴近视频分片的封装）
     - t0_ms：A 侧进入 overlay 的时间戳，用于端到端延迟测量
@@ -73,16 +73,19 @@ class OverlayEnvelope:
         )
 
 
-def make_hls_like_path(session_id: str, seq: int) -> str:
+def make_hls_like_path(session_id: str, seq: int, prefix: str = "/hls") -> str:
     # 模拟 HLS 分片命名风格：/hls/<session>/seg-000001.ts（仅作文档/展示用）
-    return f"/hls/{session_id}/seg-{seq:06d}.ts"
+    p = prefix.rstrip("/")
+    return f"{p}/{session_id}/seg-{seq:06d}.ts"
 
 
-def make_hls_master_path(session_id: str) -> str:
-    return f"/hls/{session_id}/master.m3u8"
+def make_hls_master_path(session_id: str, prefix: str = "/hls") -> str:
+    p = prefix.rstrip("/")
+    return f"{p}/{session_id}/master.m3u8"
 
 
-def make_hls_media_playlist_path(session_id: str) -> str:
+def make_hls_media_playlist_path(session_id: str, prefix: str = "/hls") -> str:
     """媒体播放列表（列出当前可拉的一条分片，模拟直播滑动窗口）。"""
-    return f"/hls/{session_id}/index.m3u8"
+    p = prefix.rstrip("/")
+    return f"{p}/{session_id}/index.m3u8"
 

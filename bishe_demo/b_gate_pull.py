@@ -26,6 +26,7 @@ class BGateConfig:
     control_host: str
     control_port: int
     reliability: ReliabilityConfig
+    queue_key_rev: str = "bishe:overlay:queue:rev"
 
 
 def _claims_from_token(cfg: BGateConfig, token: str) -> TokenClaims:
@@ -50,6 +51,8 @@ def _reset_gate_state(app: web.Application) -> None:
     app["link_token"] = ""
     app["pull_task"] = None
     app["worker_task"] = None
+    app["pull_task_rev"] = None
+    app["worker_task_rev"] = None
 
 
 async def handle_register(request: web.Request) -> web.Response:
@@ -86,7 +89,7 @@ async def handle_register(request: web.Request) -> web.Response:
             return web.json_response({"ok": False, "error": "psk mismatch between A and C register"}, status=400)
         request.app["link_psk"] = raw_psk
 
-    # 两边都登记成功 -> gate 同时启动 b-pull + b-worker
+    # 两边都登记成功 -> gate 同时启动正向 + 反向 pull/worker
     if reg.get("a") and reg.get("c") and request.app.get("pull_task") is None:
         a_url = (claims.a_url or "").strip()
         c_url = (claims.c_url or "").strip()
@@ -95,32 +98,84 @@ async def handle_register(request: web.Request) -> web.Response:
         if not c_url:
             return web.json_response({"ok": False, "error": "missing c_url in token"}, status=400)
 
+        psk_val = request.app.get("link_psk")
+        token_val = str(request.app.get("link_token") or "")
+
+        # 正向 (A→C): 从 A 的 /hls 拉 → 转发到 C 的 /recv
         logging.info(
-            "B-gate 注册完成，启动 b-pull + b-worker: a_url=%s -> c_url=%s",
+            "B-gate 注册完成，启动正向 pull+worker: a_url=%s -> c_url=%s  link_token=%s psk=%s",
             a_url,
             c_url,
+            bool(token_val),
+            psk_val is not None,
         )
+        async def _safe_task(name: str, coro):
+            try:
+                await coro
+            except asyncio.CancelledError:
+                logging.info("B-gate task %s 被取消", name)
+                raise
+            except Exception:
+                logging.exception("B-gate task %s 异常退出，5秒后重试", name)
+                await asyncio.sleep(5)
+                # 不重新抛出，让 task 自然结束（外部无法重启）
+
         request.app["pull_task"] = asyncio.create_task(
-            run_b_pull(
+            _safe_task("pull_fwd", run_b_pull(
                 a_base_url=a_url,
                 session_id="bishe-1",
                 redis_url=cfg.redis_url,
                 queue_key=cfg.queue_key,
                 poll_interval_s=cfg.poll_interval_s,
                 segment_interval_s=cfg.segment_interval_s,
-            )
+                hls_prefix="/hls",
+            ))
         )
         request.app["worker_task"] = asyncio.create_task(
-            run_b_worker(
+            _safe_task("worker_fwd", run_b_worker(
                 redis_url=cfg.redis_url,
                 queue_key=cfg.queue_key,
                 c_base_url=c_url,
-                psk=request.app.get("link_psk"),
-                link_token=str(request.app.get("link_token") or ""),
+                psk=psk_val,
+                link_token=token_val,
                 control_host=cfg.control_host,
                 control_port=cfg.control_port,
                 reliability=cfg.reliability,
-            )
+                recv_endpoint="/recv",
+                direction_label="fwd",
+            ))
+        )
+
+        # 反向 (C→A): 从 C 的 /hls-rev 拉 → 转发到 A 的 /overlay/recv-tunnel
+        logging.info(
+            "B-gate 注册完成，启动反向 pull+worker: c_url=%s -> a_url=%s",
+            c_url,
+            a_url,
+        )
+        request.app["pull_task_rev"] = asyncio.create_task(
+            _safe_task("pull_rev", run_b_pull(
+                a_base_url=c_url,  # 从 C 拉取
+                session_id="bishe-rev-1",
+                redis_url=cfg.redis_url,
+                queue_key=cfg.queue_key_rev,
+                poll_interval_s=cfg.poll_interval_s,
+                segment_interval_s=cfg.segment_interval_s,
+                hls_prefix="/hls-rev",
+            ))
+        )
+        request.app["worker_task_rev"] = asyncio.create_task(
+            _safe_task("worker_rev", run_b_worker(
+                redis_url=cfg.redis_url,
+                queue_key=cfg.queue_key_rev,
+                c_base_url=a_url,  # 转发到 A
+                psk=psk_val,
+                link_token=token_val,
+                control_host=cfg.control_host,
+                control_port=cfg.control_port,
+                reliability=cfg.reliability,
+                recv_endpoint="/overlay/recv-tunnel",
+                direction_label="rev",
+            ))
         )
 
     return web.json_response(
@@ -152,10 +207,11 @@ async def handle_stop(request: web.Request) -> web.Response:
 
     pull_task = request.app.get("pull_task")
     worker_task = request.app.get("worker_task")
-    if pull_task:
-        pull_task.cancel()
-    if worker_task:
-        worker_task.cancel()
+    pull_task_rev = request.app.get("pull_task_rev")
+    worker_task_rev = request.app.get("worker_task_rev")
+    for t in (pull_task, worker_task, pull_task_rev, worker_task_rev):
+        if t:
+            t.cancel()
 
     # 通知 A/C（尽力而为）
     await _post_stop_notice(claims.a_url.rstrip("/") + "/overlay/stop-notice", who="b-gate")
@@ -177,6 +233,8 @@ async def handle_health(request: web.Request) -> web.Response:
             "c_url": claims.c_url if claims else "",
             "pull_started": request.app.get("pull_task") is not None,
             "worker_started": request.app.get("worker_task") is not None,
+            "pull_started_rev": request.app.get("pull_task_rev") is not None,
+            "worker_started_rev": request.app.get("worker_task_rev") is not None,
         }
     )
 
@@ -193,6 +251,7 @@ async def run_b_gate_pull(
     control_host: str = "127.0.0.1",
     control_port: int | None = None,
     reliability: ReliabilityConfig | None = None,
+    queue_key_rev: str = "bishe:overlay:queue:rev",
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cport = int(control_port) if control_port is not None else int(port) + 1
@@ -208,6 +267,7 @@ async def run_b_gate_pull(
         control_host=control_host,
         control_port=cport,
         reliability=rcfg,
+        queue_key_rev=queue_key_rev,
     )
 
     app = web.Application()
@@ -218,6 +278,8 @@ async def run_b_gate_pull(
     app["link_token"] = ""
     app["pull_task"] = None
     app["worker_task"] = None
+    app["pull_task_rev"] = None
+    app["worker_task_rev"] = None
     app.router.add_get("/health", handle_health)
     app.router.add_post("/register", handle_register)
     app.router.add_post("/stop", handle_stop)

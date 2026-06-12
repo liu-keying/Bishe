@@ -20,6 +20,7 @@ class BPullConfig:
     queue_key: str
     poll_interval_s: float
     segment_interval_s: float = 0.0
+    hls_prefix: str = "/hls"
 
 
 def _envelope_from_get_response(r: httpx.Response, fallback_session: str, a_base_url: str) -> OverlayEnvelope:
@@ -109,6 +110,7 @@ async def run_b_pull(
     queue_key: str,
     poll_interval_s: float = 0.25,
     segment_interval_s: float = 0.0,
+    hls_prefix: str = "/hls",
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = BPullConfig(
@@ -118,19 +120,21 @@ async def run_b_pull(
         queue_key=queue_key,
         poll_interval_s=poll_interval_s,
         segment_interval_s=max(0.0, float(segment_interval_s)),
+        hls_prefix=hls_prefix.rstrip("/") or "/hls",
     )
 
     redis = Redis.from_url(redis_url, decode_responses=False)
     await redis.ping()
     live_session = [cfg.session_id]
-    master_url = f"{cfg.a_base_url}{make_hls_master_path(live_session[0])}"
+    master_url = f"{cfg.a_base_url}{make_hls_master_path(live_session[0], prefix=cfg.hls_prefix)}"
     seg_iv = cfg.segment_interval_s
     logging.info(
         "B pull 启动(类 HLS 客户端): master=%s -> index.m3u8 -> seg-*.ts -> Redis %s "
-        "(segment_interval_s=%s)",
+        "(segment_interval_s=%s hls_prefix=%s)",
         master_url,
         cfg.queue_key,
         seg_iv if seg_iv > 0 else "burst",
+        cfg.hls_prefix,
     )
 
     media_playlist_url: str | None = None
@@ -138,7 +142,7 @@ async def run_b_pull(
         async with httpx.AsyncClient(timeout=120.0, verify=False, trust_env=False) as client:
             while True:
                 if media_playlist_url is None:
-                    master_url = f"{cfg.a_base_url}{make_hls_master_path(live_session[0])}"
+                    master_url = f"{cfg.a_base_url}{make_hls_master_path(live_session[0], prefix=cfg.hls_prefix)}"
                     try:
                         rm = await client.get(master_url)
                     except httpx.HTTPError as e:

@@ -31,6 +31,8 @@ class BWorkerConfig:
     control_host: str = "127.0.0.1"
     control_port: int = 8011
     reliability: ReliabilityConfig | None = None
+    recv_endpoint: str = "/recv"
+    direction_label: str = "fwd"
 
 
 ASM_PREFIX = "bishe:overlay:asm:"
@@ -83,7 +85,7 @@ async def forward_one(
     send_ms = now_ms()
     meta = env.meta or {}
     phase = str(meta.get("overlay_phase") or "").strip()
-    # 伪填充分片只随 HLS 出队，不应走默认“整包转发 C”分支（否则会对整段 TS 做 PSK1 误判刷屏）
+    # 伪填充分片只随 HLS 出队，不应走默认"整包转发 C"分支（否则会对整段 TS 做 PSK1 误判刷屏）
     if phase == "pad":
         return False
 
@@ -151,7 +153,7 @@ async def forward_one(
                 dkey = _cipher_b_asm_key(env.session_id, cg)
                 async with _cipher_asm_lock:
                     # 方案 B：密文被均分为 k 份。只有第 0 片应以 "PSK1" 开头（整包 AEAD 格式头），
-                    # 可用作“防误判”哨兵：若第 0 片不是 PSK1，则多半是误提取（MAGIC 撞车）或数据损坏。
+                    # 可用作"防误判"哨兵：若第 0 片不是 PSK1，则多半是误提取（MAGIC 撞车）或数据损坏。
                     if ci == 0 and not _looks_like_psk1(payload):
                         logging.warning(
                             "cipher 分片 idx=0 非 PSK1，疑似误提取/损坏：session=%s group=%s… bytes=%d（丢弃该片）",
@@ -213,7 +215,7 @@ async def forward_one(
                     len(payload),
                 )
             else:
-                # 无 cipher_group：不再支持“仅最后一片 trailer 携带整包密文”的旧路径；这类分片直接跳过。
+                # 无 cipher_group：不再支持"仅最后一片 trailer 携带整包密文"的旧路径；这类分片直接跳过。
                 logging.info(
                     "无 cipher_group，跳过转发：session=%s seq=%s hls=%d/%d",
                     env.session_id,
@@ -251,13 +253,14 @@ async def forward_one(
                     cipher_group=cg,
                     a_url=a_url0,
                     rcfg=rcfg,
+                    recv_endpoint=cfg.recv_endpoint,
                 )
                 if status == 200:
                     return True
                 if status == 400:
                     return False
                 raise RuntimeError(f"C 返回异常: status={status} body={body[:200]}")
-            url = f"{c_url.rstrip('/')}/recv"
+            url = f"{c_url.rstrip('/')}{cfg.recv_endpoint}"
             r = await client.post(url, content=payload, headers=headers)
             if r.status_code != 200:
                 raise RuntimeError(f"C 返回异常: status={r.status_code} body={r.text[:200]}")
@@ -320,7 +323,7 @@ async def forward_one(
 
         await redis.delete(dkey)
 
-        # 组装后同样按 overlay meta 走“是否为密文/分片”的筛选与组装逻辑，避免误提取 trailer 直接打到 C。
+        # 组装后同样按 overlay meta 走"是否为密文/分片"的筛选与组装逻辑，避免误提取 trailer 直接打到 C。
         cg = str(meta.get("cipher_group") or "").strip()
         ck = int(meta.get("cipher_k") or 0)
         if cg and ck >= 1:
@@ -428,13 +431,14 @@ async def forward_one(
                 cipher_group=cg,
                 a_url=a_url3,
                 rcfg=rcfg3,
+                recv_endpoint=cfg.recv_endpoint,
             )
             if status == 200:
                 return True
             if status == 400:
                 return False
             raise RuntimeError(f"C 返回异常: status={status} body={body[:200]}")
-        url = f"{c_url.rstrip('/')}/recv"
+        url = f"{c_url.rstrip('/')}{cfg.recv_endpoint}"
         r = await client.post(url, content=payload, headers=headers)
         if r.status_code != 200:
             raise RuntimeError(f"C 返回异常: status={r.status_code} body={r.text[:200]}")
@@ -445,11 +449,11 @@ async def forward_one(
     if not c_url:
         raise RuntimeError("未配置目标 C：请在 A->B 的封装 meta 里带 c_url，或启动 b-worker 时提供 --c-url")
 
-    url = f"{c_url.rstrip('/')}/recv"
+    url = f"{c_url.rstrip('/')}{cfg.recv_endpoint}"
     payload = env.unpack_payload()
 
     # 兜底保护：只要要发给 C 的不是 PSK1 AEAD 包，就直接丢弃。
-    # 否则（例如 b-pull 误把某些“非媒体/非密文”任务塞进队列）会导致 C 被大量 400 轰炸。
+    # 否则（例如 b-pull 误把某些"非媒体/非密文"任务塞进队列）会导致 C 被大量 400 轰炸。
     if not _looks_like_psk1(payload):
         logging.info(
             "默认转发分支检测到非 PSK1 payload，跳过：session=%s seq=%s bytes=%d",
@@ -484,6 +488,8 @@ async def run_b_worker(
     control_host: str = "127.0.0.1",
     control_port: int = 8011,
     reliability: ReliabilityConfig | None = None,
+    recv_endpoint: str = "/recv",
+    direction_label: str = "fwd",
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     rcfg = reliability if reliability is not None else ReliabilityConfig()
@@ -496,15 +502,19 @@ async def run_b_worker(
         control_host=control_host,
         control_port=control_port,
         reliability=rcfg,
+        recv_endpoint=recv_endpoint.rstrip("/") or "/recv",
+        direction_label=direction_label or "fwd",
     )
 
     redis = Redis.from_url(redis_url, decode_responses=False)
     await redis.ping()
     logging.info(
-        "B worker 已连接 Redis: %s (queue=%s) -> C=%s reliability=%s",
+        "B worker [%s] 已连接 Redis: %s (queue=%s) -> %s%s reliability=%s",
+        cfg.direction_label,
         redis_url,
         queue_key,
         c_base_url,
+        cfg.recv_endpoint,
         rcfg.enabled,
     )
 
@@ -522,10 +532,18 @@ async def run_b_worker(
             watchdog_task = asyncio.create_task(reliability_watchdog_loop(redis, client, rcfg))
         try:
             while True:
-                item = await redis.blpop(queue_key, timeout=cfg.blpop_timeout_s)
+                try:
+                    item = await redis.blpop(queue_key, timeout=cfg.blpop_timeout_s)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logging.warning("B worker [%s] BLPOP 异常，1s后重试: %r", cfg.direction_label, e)
+                    await asyncio.sleep(1)
+                    continue
                 if item is None:
                     continue
                 _, data = item
+                logging.debug("B worker [%s] BLPOP 获取一条消息 len=%d", cfg.direction_label, len(data))
                 try:
                     env = OverlayEnvelope.from_json_bytes(data)
                     env2 = OverlayEnvelope.pack(

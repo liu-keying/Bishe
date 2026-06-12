@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import ssl
+import time
 import uuid
 from pathlib import Path
 
@@ -11,8 +13,25 @@ from aiohttp import web
 
 from .common import now_ms
 from .crypto_box import aead_decrypt, b64d, b64e, generate_rsa_keypair, rsa_oaep_unwrap, rsa_pub_to_pem
-from .psk_aead import decrypt_hidden
-from .stego import STEGO_METHOD_PSK_HMAC_INPLACE
+from .hls_shared import register_hls_routes, setup_hls_state
+from .psk_aead import decrypt_hidden, encrypt_hidden
+from .stego import (
+    STEGO_METHOD_PSK_HMAC_INPLACE,
+    STEGO_TAG_LEN,
+    embed_pad_inplace,
+    embed_psk_inplace,
+)
+from .tunnel import (
+    CTL_CONNECT,
+    CTL_CONNECTED,
+    CTL_ERROR,
+    CTL_FIN,
+    TunnelCtl,
+    TunnelData,
+    TunnelExit,
+    TUNNEL_MAGIC,
+    MAGIC_OFFSET,
+)
 
 
 def _percentile(sorted_vals: list[float], p: float) -> float | None:
@@ -54,6 +73,117 @@ async def _notify_b_recv_ack(
         logging.exception("C -> B recv-ack 失败 delivery_id=%s ok=%s", delivery_id, ok)
 
 
+def _embed_to_rev_hls(app: web.Application, payload: bytes) -> None:
+    """将隧道响应消息加密后嵌入 C 的反向 HLS 分片队列。
+
+    使用与 A 相同的 psk_hmac_inplace 方法。
+    """
+    psk: bytes | None = app.get("psk")
+    link_token = str(app.get("link_token") or "").strip()
+    if psk is None or not link_token:
+        logging.warning("SOCKS5(C): PSK/link_token 未就绪，丢弃反向消息")
+        return
+
+    session_id = str(app.get("session_id_rev") or "")
+    aad = session_id.encode("utf-8")
+    hidden = encrypt_hidden(psk=psk, hidden=payload, aad=aad)
+
+    orig_len = len(hidden)  # 记录原始 AEAD 密文长度（截断用）
+    g_bytes = max(32768, len(hidden))
+    if len(hidden) < g_bytes:
+        hidden = hidden + os.urandom(g_bytes - len(hidden))
+    part = hidden[:g_bytes]
+
+    seq = int(app.get("seq_rev") or 1)
+    app["seq_rev"] = seq + 1
+    emit_sess = str(app.get("session_id_rev") or "")
+
+    try:
+        blob = embed_psk_inplace(
+            b"\x00" * (g_bytes + STEGO_TAG_LEN),
+            token=link_token,
+            hls_index=0,
+            frag_idx=0,
+            cipher_fragment=part,
+        )
+    except Exception as e:
+        logging.warning("SOCKS5(C): embed 失败: %r", e)
+        return
+
+    # PendingPullJob 需要这些字段，这里构造最小版本
+    from dataclasses import dataclass as _dc
+
+    @_dc
+    class _RevJob:
+        seq: int = 0
+        t0_ms: int = 0
+        c_url: str = ""
+        ua: str = "rev"
+        a_recv_ms: int = 0
+        content_type: str = "application/octet-stream"
+        blob: bytes = b""
+        emit_session: str = ""
+        hls_index: int = 0
+        hls_total: int = 1
+        cipher_group: str = ""
+        cipher_k: int = 1
+        cipher_index: int = 0
+        cipher_bytes: int = 0
+        overlay_phase: str = "media"
+        stego_frag_body_len: int = 0
+
+    import uuid as _uuid
+
+    job = _RevJob(
+        seq=seq,
+        blob=blob,
+        emit_session=emit_sess,
+        cipher_group=_uuid.uuid4().hex,  # 必须非空，worker 才处理
+        cipher_bytes=orig_len,  # 原始 AEAD 长度（不含填充），worker 据此截断
+        stego_frag_body_len=g_bytes,
+    )
+    app["pull_queue_rev"].append(job)
+    logging.debug("SOCKS5(C): 响应已入反向 HLS 队列 seq=%d bytes=%d", seq, len(hidden))
+
+
+async def _tunnel_read_loop(app: web.Application) -> None:
+    """持续从 TunnelExit 读取目标响应数据，嵌入反向 HLS。"""
+    buffer_size = 32768
+    while True:
+        exit_: TunnelExit = app.get("tunnel_exit")
+        if exit_ is None:
+            await asyncio.sleep(1)
+            continue
+
+        conn_ids = exit_.get_active_conns()
+        if not conn_ids:
+            await asyncio.sleep(0.1)
+            continue
+
+        for conn_id in conn_ids:
+            try:
+                data = await exit_.recv(conn_id, buffer_size)
+            except Exception:
+                continue
+            if data is None:
+                continue
+            if not data:
+                # EOF
+                ctl = TunnelCtl(conn_id=conn_id, ctl_type=CTL_FIN)
+                _embed_to_rev_hls(app, ctl.to_bytes())
+                await exit_.close(conn_id)
+                continue
+
+            seq_map = app.setdefault("tunnel_seq_rev", {})
+            seq = seq_map.get(conn_id, 0) + 1
+            seq_map[conn_id] = seq
+
+            td = TunnelData(conn_id=conn_id, seq=seq, data=data)
+            _embed_to_rev_hls(app, td.to_bytes())
+
+        await asyncio.sleep(0.05)  # 简短间隙，避免 CPU 空转
+
+
 async def handle_recv(request: web.Request) -> web.Response:
     payload = await request.read()
     psk: bytes | None = request.app.get("psk")
@@ -82,7 +212,7 @@ async def handle_recv(request: web.Request) -> web.Response:
 
     try:
         aad = session_id_hdr.encode("utf-8")
-        payload = decrypt_hidden(psk=psk, payload=payload, aad=aad)
+        plain = decrypt_hidden(psk=psk, payload=payload, aad=aad)
     except Exception as e:
         if delivery_id_hdr:
             asyncio.create_task(
@@ -97,6 +227,14 @@ async def handle_recv(request: web.Request) -> web.Response:
             )
         return web.json_response({"ok": False, "error": f"decrypt failed: {e!r}"}, status=400)
 
+    # --- 隧道消息处理（SOCKS5） ---
+    if TunnelCtl.is_tunnel_ctl(plain):
+        return await _handle_tunnel_ctl(request, plain)
+    if TunnelData.is_tunnel_data(plain):
+        return await _handle_tunnel_data(request, plain)
+
+    # 以下为原有隐匿数据处理
+    payload = plain
     t0_ms = int(request.headers.get("X-T0-MS", "0") or "0")
     b_send_ms = int(request.headers.get("X-B-SEND-MS", "0") or "0")
     t_recv = now_ms()
@@ -157,6 +295,53 @@ async def handle_recv(request: web.Request) -> web.Response:
             "b2c_ms": b2c_ms,
         }
     )
+
+
+async def _handle_tunnel_ctl(request: web.Request, plain: bytes) -> web.Response:
+    """处理隧道控制消息（C 侧）。"""
+    ctl = TunnelCtl.from_bytes(plain)
+    if ctl is None:
+        return web.json_response({"ok": False, "error": "bad tunnel ctl"}, status=400)
+
+    exit_: TunnelExit = request.app.get("tunnel_exit")
+    if exit_ is None:
+        return web.json_response({"ok": False, "error": "tunnel not enabled"}, status=503)
+
+    if ctl.ctl_type == CTL_CONNECT:
+        ok = await exit_.connect(ctl.conn_id, ctl.host, ctl.port)
+        resp = TunnelCtl(
+            conn_id=ctl.conn_id,
+            ctl_type=CTL_CONNECTED if ok else CTL_ERROR,
+            error="" if ok else f"connect {ctl.host}:{ctl.port} failed",
+        )
+        _embed_to_rev_hls(request.app, resp.to_bytes())
+        return web.json_response({"ok": True, "conn_id": ctl.conn_id, "connected": ok})
+
+    if ctl.ctl_type == CTL_FIN:
+        await exit_.close(ctl.conn_id)
+        return web.json_response({"ok": True, "conn_id": ctl.conn_id, "closed": True})
+
+    return web.json_response({"ok": False, "error": f"unknown ctl_type: {ctl.ctl_type}"}, status=400)
+
+
+async def _handle_tunnel_data(request: web.Request, plain: bytes) -> web.Response:
+    """处理隧道数据消息（C 侧）：写入目标 TCP 连接。"""
+    td = TunnelData.from_bytes(plain)
+    if td is None:
+        return web.json_response({"ok": False, "error": "bad tunnel data"}, status=400)
+
+    exit_: TunnelExit = request.app.get("tunnel_exit")
+    if exit_ is None:
+        return web.json_response({"ok": False, "error": "tunnel not enabled"}, status=503)
+
+    ok = await exit_.send(td.conn_id, td.data)
+    if not ok:
+        return web.json_response({"ok": False, "error": "conn not found or write failed"}, status=404)
+
+    if td.fin:
+        await exit_.close(td.conn_id)
+
+    return web.json_response({"ok": True, "conn_id": td.conn_id, "bytes": len(td.data)})
 
 
 async def handle_health(_: web.Request) -> web.Response:
@@ -233,10 +418,13 @@ async def run_c_server(
     b_gate_url: str = "",
     psk_hex: str = "",
     b_callback_url: str = "",
+    socks_enabled: bool = False,
+    socks_max_conns: int = 50,
+    socks_idle_timeout: float = 300.0,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    # /recv 可能承载“整段密文”或更大的 trailer，默认 1MB 会触发 413
+    # /recv 可能承载"整段密文"或更大的 trailer，默认 1MB 会触发 413
     app = web.Application(client_max_size=256 * 1024 * 1024)
     app["stats"] = {"start_ms": now_ms(), "recv_count": 0, "dup_count": 0, "recv_bytes": 0, "events": [], "seen_msg_ids": set()}
     app["psk"] = None
@@ -244,6 +432,22 @@ async def run_c_server(
     app["b_callback_url"] = (b_callback_url or "").strip()
     if app["b_callback_url"]:
         logging.info("C 启用 B 回执: %s", app["b_callback_url"])
+
+    # SOCKS5 隧道状态（C 侧出口）
+    app["tunnel_exit"] = TunnelExit(max_conns=socks_max_conns, idle_timeout_s=socks_idle_timeout)
+    app["tunnel_enabled"] = socks_enabled
+    app["tunnel_seq_rev"]: dict[str, int] = {}
+
+    # 反向 HLS 状态（C 提供 HLS 服务，供 B-gate 拉取响应数据回传 A）
+    setup_hls_state(app, "bishe-rev-1")
+    # 覆盖为固定 session ID（"bishe-rev-1" 不符合 bishe-<N> 格式，setup_hls_state 解析后会变成 bishe-1）
+    app["session_id"] = "bishe-rev-1"
+    app["session_id_rev"] = "bishe-rev-1"
+    app["seq_rev"] = app["seq"]
+    app["pull_queue_rev"] = app["pull_queue"]   # 别名，供 _embed_to_rev_hls 使用
+
+    if socks_enabled:
+        logging.info("C 启用 SOCKS5 隧道出口 (max_conns=%d)", socks_max_conns)
 
     psk_hex2 = (psk_hex or "").strip()
     if psk_hex2:
@@ -314,6 +518,9 @@ async def run_c_server(
     app.router.add_get("/health", handle_health)
     app.router.add_post("/stop-notice", handle_stop_notice)
 
+    # 反向 HLS 路由（供 B-gate 拉取 C→A 响应数据）
+    register_hls_routes(app, "/hls-rev")
+
     runner = web.AppRunner(app)
     await runner.setup()
 
@@ -326,8 +533,12 @@ async def run_c_server(
 
     site = web.TCPSite(runner, host=host, port=port, ssl_context=ssl_ctx)
     scheme = "https" if ssl_ctx else "http"
-    logging.info("C 服务端启动: %s://%s:%d", scheme, host, port)
+    logging.info("C 服务端启动: %s://%s:%d (recv + rev-hls + stats)", scheme, host, port)
     await site.start()
+
+    # 隧道读循环（持续从目标 TCP 读取响应数据）
+    if socks_enabled:
+        asyncio.create_task(_tunnel_read_loop(app))
 
     while True:
         await asyncio.sleep(3600)

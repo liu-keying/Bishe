@@ -121,6 +121,53 @@ def build_parser() -> argparse.ArgumentParser:
         default=int(os.environ.get("BISHE_C_RESEND_MAX", "3")),
         help="B 向 C 重发 /recv 的最大次数",
     )
+
+    # ---- SOCKS5 代理参数 ----
+    p.add_argument(
+        "--socks-listen",
+        default=os.environ.get("BISHE_SOCKS_LISTEN", "127.0.0.1"),
+        help="SOCKS5 代理监听地址（A 角色）",
+    )
+    p.add_argument(
+        "--socks-port",
+        type=int,
+        default=int(os.environ.get("BISHE_SOCKS_PORT", "0")),
+        help="SOCKS5 代理端口，0=禁用（A 角色）",
+    )
+    p.add_argument(
+        "--no-socks",
+        action="store_true",
+        help="显式禁用 SOCKS5 代理（A/C 角色）",
+    )
+    p.add_argument(
+        "--socks-buffer-size",
+        type=int,
+        default=int(os.environ.get("BISHE_SOCKS_BUFFER_SIZE", "32768")),
+        help="SOCKS5 TCP 读缓冲字节数",
+    )
+    p.add_argument(
+        "--socks-connect-timeout",
+        type=float,
+        default=float(os.environ.get("BISHE_SOCKS_CONNECT_TIMEOUT", "30")),
+        help="SOCKS5 等待 C 建连超时秒数",
+    )
+    p.add_argument(
+        "--socks-idle-timeout",
+        type=float,
+        default=float(os.environ.get("BISHE_SOCKS_IDLE_TIMEOUT", "300")),
+        help="SOCKS5 空闲连接超时秒数",
+    )
+    p.add_argument(
+        "--socks-max-conns",
+        type=int,
+        default=int(os.environ.get("BISHE_SOCKS_MAX_CONNS", "50")),
+        help="SOCKS5 最大并发隧道连接数",
+    )
+    p.add_argument(
+        "--queue-rev",
+        default=os.environ.get("BISHE_QUEUE_REV", "bishe:overlay:queue:rev"),
+        help="反向 Redis 队列 key（B-gate 角色，C→A 方向）",
+    )
     return p
 
 
@@ -129,6 +176,7 @@ async def _amain() -> None:
 
     if args.role == "a":
         sid = (args.session or "").strip() or None
+        socks_on = not args.no_socks and args.socks_port > 0
         await run_a_proxy(
             host=args.host,
             port=args.port,
@@ -136,6 +184,12 @@ async def _amain() -> None:
             e_url=(args.e_url or "").strip(),
             c_url=args.c_url,
             b_gate_url=(args.b_gate_url or "").strip(),
+            socks_host=args.socks_listen,
+            socks_port=args.socks_port,
+            socks_enabled=socks_on,
+            socks_buffer_size=args.socks_buffer_size,
+            socks_connect_timeout=args.socks_connect_timeout,
+            socks_idle_timeout=args.socks_idle_timeout,
         )
         return
     if args.role == "b-pull":
@@ -167,6 +221,7 @@ async def _amain() -> None:
             control_host=args.control_host,
             control_port=int(args.control_port),
             reliability=rcfg_gate,
+            queue_key_rev=(args.queue_rev or "").strip() or "bishe:overlay:queue:rev",
         )
         return
     if args.role == "b-worker":
@@ -188,6 +243,7 @@ async def _amain() -> None:
     if args.role == "c":
         cert = (args.ssl_cert or "").strip() or None
         key = (args.ssl_key or "").strip() or None
+        socks_on = not args.no_socks
         await run_c_server(
             host=args.host,
             port=args.port,
@@ -198,6 +254,9 @@ async def _amain() -> None:
             b_gate_url=(args.b_gate_url or "").strip(),
             psk_hex=(args.psk_hex or "").strip(),
             b_callback_url=(args.b_callback_url or "").strip(),
+            socks_enabled=socks_on,
+            socks_max_conns=args.socks_max_conns,
+            socks_idle_timeout=args.socks_idle_timeout,
         )
         return
     if args.role == "e":

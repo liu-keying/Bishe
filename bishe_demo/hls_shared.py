@@ -1,7 +1,7 @@
 """
 共享 HLS 服务模块。
 
-从 a_client_proxy.py 提取，供 A（正向 /hls）和 C（反向 /hls-rev）共同复用。
+从 client_proxy.py 提取，供 client（正向 /hls）和 server（反向 /hls-rev）共同复用。
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ from aiohttp import web
 from .common import now_ms
 from .stego import STEGO_METHOD_PSK_HMAC_INPLACE
 
-# ---- 重新导出 a_client_proxy 使用的 dataclass ----
-# （a_client_proxy.py 中定义的 PendingPullJob 也在此处可用，
+# ---- 重新导出 client_proxy 使用的 dataclass ----
+# （client_proxy.py 中定义的 PendingPullJob 也在此处可用，
 #   但为避免循环导入，hls_shared 不直接依赖 PendingPullJob，
 #   handler 通过 app 状态与任务队列交互）
 
@@ -55,13 +55,13 @@ def _segment_response(job: Any, *, next_session: str | None = None) -> web.Respo
         "X-Bishe-Kind": "media",
         "X-Bishe-Stego": STEGO_METHOD_PSK_HMAC_INPLACE,
         "X-Bishe-Overlay-Phase": (job.overlay_phase or "media").strip(),
-        "X-C-URL": job.c_url,
+        "X-C-URL": job.server_url if hasattr(job, 'server_url') else getattr(job, 'c_url', ''),
         "X-Session": job.emit_session,
         "X-Seq": str(job.seq),
         "X-T0-MS": str(job.t0_ms),
         "X-Content-Type": job.content_type,
         "X-A-UA": job.ua,
-        "X-A-Recv-MS": str(job.a_recv_ms),
+        "X-A-Recv-MS": str(job.client_recv_ms if hasattr(job, 'client_recv_ms') else getattr(job, 'a_recv_ms', 0)),
     }
     if next_session:
         headers["X-Next-Session"] = next_session

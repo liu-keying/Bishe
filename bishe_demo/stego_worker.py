@@ -7,24 +7,24 @@ from dataclasses import dataclass
 import httpx
 from redis.asyncio import Redis
 
-from .b_reliability import (
+from .reliability import (
     ReliabilityConfig,
     clear_frag_watch,
     delivery_id,
-    post_to_c,
+    post_to_server,
     register_frag_watch,
     reliability_watchdog_loop,
-    run_b_control_server,
+    run_control_server,
 )
 from .common import OverlayEnvelope, now_ms
 from .stego import STEGO_METHOD_PSK_HMAC_INPLACE, extract_psk_inplace, extract_trailer
 
 
 @dataclass(frozen=True)
-class BWorkerConfig:
+class StegoWorkerConfig:
     redis_url: str
     queue_key: str
-    c_base_url: str
+    server_base_url: str
     blpop_timeout_s: int = 5
     psk: bytes | None = None
     link_token: str = ""
@@ -37,13 +37,13 @@ class BWorkerConfig:
 
 ASM_PREFIX = "bishe:overlay:asm:"
 
-# 方案 B：密文分片在 B 侧拼成整包 AEAD 后再 POST 给 C（C 只做单次 decrypt）
+# 方案 B：密文分片在 gateway 侧拼成整包 AEAD 后再 POST 给 server（server 只做单次 decrypt）
 CIPHER_B_ASM_PREFIX = "bishe:cipher_b_asm:"
 
 _cipher_asm_lock = asyncio.Lock()
 
 
-def _extract_stego_payload(*, video: bytes, meta: dict, cfg: BWorkerConfig) -> bytes:
+def _extract_stego_payload(*, video: bytes, meta: dict, cfg: StegoWorkerConfig) -> bytes:
     em = str(meta.get("extract_method") or STEGO_METHOD_PSK_HMAC_INPLACE).strip()
     if em == STEGO_METHOD_PSK_HMAC_INPLACE:
         if not (cfg.link_token or "").strip():
@@ -78,14 +78,14 @@ def _cipher_b_asm_key(session_id: str, cipher_group: str) -> str:
 
 async def forward_one(
     client: httpx.AsyncClient,
-    cfg: BWorkerConfig,
+    cfg: StegoWorkerConfig,
     env: OverlayEnvelope,
     redis: Redis,
 ) -> bool:
     send_ms = now_ms()
     meta = env.meta or {}
     phase = str(meta.get("overlay_phase") or "").strip()
-    # 伪填充分片只随 HLS 出队，不应走默认"整包转发 C"分支（否则会对整段 TS 做 PSK1 误判刷屏）
+    # 伪填充分片只随 HLS 出队，不应走默认"整包转发 server"分支（否则会对整段 TS 做 PSK1 误判刷屏）
     if phase == "pad":
         return False
 
@@ -95,19 +95,19 @@ async def forward_one(
         media_group_id = str(meta.get("media_group_id") or "").strip()
         hls_total = int(meta.get("hls_total") or 1)
         hls_index = int(meta.get("hls_index") or 0)
-        meta_c_url = str(meta.get("c_url") or "").strip()
+        meta_server_url = str(meta.get("server_url") or meta.get("c_url") or "").strip()
         overlay_phase = str(meta.get("overlay_phase") or "media").strip()
         cipher_group = str(meta.get("cipher_group") or "").strip()
         cipher_k = int(meta.get("cipher_k") or 0)
 
         if overlay_phase == "pad":
-            # A 侧追加的伪填充分片：不入队转发
+            # client 侧追加的伪填充分片：不入队转发
             return False
 
         if hls_total > 1 and hls_index < hls_total - 1:
             if chunk_total > 1:
                 raise RuntimeError("中间 HLS 分片不应使用字节分块（chunk_total>1）")
-            # 兼容提示：历史上可能只有最后一片含隐匿；当前实现下中间分片也可能携带密文分片（取决于 A 的 embed 策略）
+            # 兼容提示：历史上可能只有最后一片含隐匿；当前实现下中间分片也可能携带密文分片（取决于 client 的 embed 策略）
             if not cipher_group and cipher_k <= 1:
                 logging.info(
                     "HLS 纯媒体分片（无隐匿）已跳过 session=%s seq=%s hls=%d/%d",
@@ -119,16 +119,16 @@ async def forward_one(
                 return False
 
         if chunk_total <= 1:
-            c_url = meta_c_url or cfg.c_base_url
+            server_url = meta_server_url or cfg.server_base_url
             video = env.unpack_payload()
             try:
                 payload = _extract_stego_payload(video=video, meta=meta, cfg=cfg)
             except ValueError as e:
-                a_url = str(meta.get("a_url") or "").strip()
-                if a_url:
+                source_url = str(meta.get("source_url") or meta.get("a_url") or "").strip()
+                if source_url:
                     try:
                         await client.post(
-                            f"{a_url.rstrip('/')}/overlay/error-notice",
+                            f"{source_url.rstrip('/')}/overlay/error-notice",
                             json={
                                 "session_id": env.session_id,
                                 "seq": env.seq,
@@ -138,10 +138,10 @@ async def forward_one(
                             headers={"X-Overlay": "1"},
                         )
                     except Exception:
-                        logging.exception("通知 A error-notice 失败")
+                        logging.exception("通知 client error-notice 失败")
                 raise
-            if not c_url:
-                raise RuntimeError("未配置目标 C：control 中 c_url 为空且未设置 b-worker --c-url")
+            if not server_url:
+                raise RuntimeError("未配置目标 server：control 中 server_url 为空且未设置 gateway-worker --server-url")
 
             cg = str(meta.get("cipher_group") or "").strip()
             ck = int(meta.get("cipher_k") or 0)
@@ -168,13 +168,13 @@ async def forward_one(
                     n_parts = await redis.hlen(dkey)
                     rcfg = cfg.reliability
                     if rcfg and rcfg.enabled:
-                        a_url0 = str(meta.get("a_url") or "").strip()
+                        source_url0 = str(meta.get("source_url") or meta.get("a_url") or "").strip()
                         await register_frag_watch(
                             redis,
                             session_id=env.session_id,
                             cipher_group=cg,
                             cipher_k=ck,
-                            a_url=a_url0,
+                            client_url=source_url0,
                             rcfg=rcfg,
                         )
                     if n_parts < ck:
@@ -197,7 +197,7 @@ async def forward_one(
                         blobs.append(b)
                     payload = b"".join(blobs)
                     await redis.delete(dkey)
-                # A 侧可能把密文补齐到 k*g_bytes（便于固定片大小）；这里按真实密文长度截断，否则 GCM tag 会 InvalidTag。
+                # client 侧可能把密文补齐到 k*g_bytes（便于固定片大小）；这里按真实密文长度截断，否则 GCM tag 会 InvalidTag。
                 if cipher_bytes_real > 0:
                     payload = payload[:cipher_bytes_real]
                 if not _looks_like_psk1(payload):
@@ -209,7 +209,7 @@ async def forward_one(
                     )
                     return False
                 logging.info(
-                    "cipher 已在 B 组装完成 session=%s group=%s… bytes=%d -> C",
+                    "cipher 已在 gateway 组装完成 session=%s group=%s… bytes=%d -> server",
                     env.session_id,
                     cg[:16],
                     len(payload),
@@ -233,25 +233,25 @@ async def forward_one(
                 "X-Session": env.session_id,
                 "X-Seq": str(env.seq),
                 "X-T0-MS": str(env.t0_ms),
-                "X-B-SEND-MS": str(send_ms),
+                "X-GW-SEND-MS": str(send_ms),
                 "X-Bishe-HLS-Index": str(hls_index),
                 "X-Bishe-HLS-Total": str(hls_total),
                 "X-Bishe-Cipher-Index": str(int(meta.get("cipher_index") or 0)),
             }
-            a_url0 = str(meta.get("a_url") or "").strip()
+            source_url0 = str(meta.get("source_url") or meta.get("a_url") or "").strip()
             rcfg = cfg.reliability
             did = delivery_id(env.session_id, cg) if cg else delivery_id(env.session_id, str(env.seq))
             if rcfg and rcfg.enabled:
-                status, body = await post_to_c(
+                status, body = await post_to_server(
                     client,
-                    c_url=c_url,
+                    server_url=server_url,
                     payload=payload,
                     headers=headers,
                     did=did,
                     redis=redis,
                     session_id=env.session_id,
                     cipher_group=cg,
-                    a_url=a_url0,
+                    client_url=source_url0,
                     rcfg=rcfg,
                     recv_endpoint=cfg.recv_endpoint,
                 )
@@ -259,11 +259,11 @@ async def forward_one(
                     return True
                 if status == 400:
                     return False
-                raise RuntimeError(f"C 返回异常: status={status} body={body[:200]}")
-            url = f"{c_url.rstrip('/')}{cfg.recv_endpoint}"
+                raise RuntimeError(f"server 返回异常: status={status} body={body[:200]}")
+            url = f"{server_url.rstrip('/')}{cfg.recv_endpoint}"
             r = await client.post(url, content=payload, headers=headers)
             if r.status_code != 200:
-                raise RuntimeError(f"C 返回异常: status={r.status_code} body={r.text[:200]}")
+                raise RuntimeError(f"server 返回异常: status={r.status_code} body={r.text[:200]}")
             return True
 
         if not media_group_id:
@@ -288,9 +288,9 @@ async def forward_one(
         )
         if n_parts < chunk_total:
             return False
-        c_url = meta_c_url or cfg.c_base_url
-        if not c_url:
-            raise RuntimeError("未配置目标 C：请在 A 的响应头带 X-C-URL 或启动 b-worker 时提供 --c-url")
+        server_url = meta_server_url or cfg.server_base_url
+        if not server_url:
+            raise RuntimeError("未配置目标 server：请在 client 的响应头带 X-C-URL 或启动 gateway-worker 时提供 --server-url")
 
         blobs: list[bytes] = []
         for i in range(chunk_total):
@@ -303,11 +303,11 @@ async def forward_one(
         try:
             payload = _extract_stego_payload(video=video, meta=meta, cfg=cfg)
         except ValueError as e:
-            a_url = str(meta.get("a_url") or "").strip()
-            if a_url:
+            source_url = str(meta.get("source_url") or meta.get("a_url") or "").strip()
+            if source_url:
                 try:
                     await client.post(
-                        f"{a_url.rstrip('/')}/overlay/error-notice",
+                        f"{source_url.rstrip('/')}/overlay/error-notice",
                         json={
                             "session_id": sid,
                             "seq": env.seq,
@@ -318,12 +318,12 @@ async def forward_one(
                         headers={"X-Overlay": "1"},
                     )
                 except Exception:
-                    logging.exception("通知 A error-notice 失败")
+                    logging.exception("通知 client error-notice 失败")
             raise
 
         await redis.delete(dkey)
 
-        # 组装后同样按 overlay meta 走"是否为密文/分片"的筛选与组装逻辑，避免误提取 trailer 直接打到 C。
+        # 组装后同样按 overlay meta 走"是否为密文/分片"的筛选与组装逻辑，避免误提取 trailer 直接打到 server。
         cg = str(meta.get("cipher_group") or "").strip()
         ck = int(meta.get("cipher_k") or 0)
         if cg and ck >= 1:
@@ -347,13 +347,13 @@ async def forward_one(
                 n2 = await redis.hlen(dkey2)
                 rcfg2 = cfg.reliability
                 if rcfg2 and rcfg2.enabled:
-                    a_url2 = str(meta.get("a_url") or "").strip()
+                    source_url2 = str(meta.get("source_url") or meta.get("a_url") or "").strip()
                     await register_frag_watch(
                         redis,
                         session_id=sid,
                         cipher_group=cg,
                         cipher_k=ck,
-                        a_url=a_url2,
+                        client_url=source_url2,
                         rcfg=rcfg2,
                     )
                 if n2 < ck:
@@ -387,7 +387,7 @@ async def forward_one(
                 )
                 return False
             logging.info(
-                "cipher 已在 B 组装完成（chunk-asm 后）session=%s group=%s… bytes=%d -> C",
+                "cipher 已在 gateway 组装完成（chunk-asm 后）session=%s group=%s… bytes=%d -> server",
                 sid,
                 cg[:16],
                 len(payload),
@@ -411,25 +411,25 @@ async def forward_one(
             "X-Session": sid,
             "X-Seq": str(env.seq),
             "X-T0-MS": str(env.t0_ms),
-            "X-B-SEND-MS": str(send_ms),
+            "X-GW-SEND-MS": str(send_ms),
             "X-Bishe-HLS-Index": str(hi),
             "X-Bishe-HLS-Total": str(ht),
             "X-Bishe-Cipher-Index": str(int(meta.get("cipher_index") or 0)),
         }
-        a_url3 = str(meta.get("a_url") or "").strip()
+        source_url3 = str(meta.get("source_url") or meta.get("a_url") or "").strip()
         rcfg3 = cfg.reliability
         did3 = delivery_id(sid, cg) if cg else delivery_id(sid, str(env.seq))
         if rcfg3 and rcfg3.enabled:
-            status, body = await post_to_c(
+            status, body = await post_to_server(
                 client,
-                c_url=c_url,
+                server_url=server_url,
                 payload=payload,
                 headers=headers,
                 did=did3,
                 redis=redis,
                 session_id=sid,
                 cipher_group=cg,
-                a_url=a_url3,
+                client_url=source_url3,
                 rcfg=rcfg3,
                 recv_endpoint=cfg.recv_endpoint,
             )
@@ -437,23 +437,23 @@ async def forward_one(
                 return True
             if status == 400:
                 return False
-            raise RuntimeError(f"C 返回异常: status={status} body={body[:200]}")
-        url = f"{c_url.rstrip('/')}{cfg.recv_endpoint}"
+            raise RuntimeError(f"server 返回异常: status={status} body={body[:200]}")
+        url = f"{server_url.rstrip('/')}{cfg.recv_endpoint}"
         r = await client.post(url, content=payload, headers=headers)
         if r.status_code != 200:
-            raise RuntimeError(f"C 返回异常: status={r.status_code} body={r.text[:200]}")
+            raise RuntimeError(f"server 返回异常: status={r.status_code} body={r.text[:200]}")
         return True
 
     # 默认：直接转发原始 payload（原 demo 行为）
-    c_url = str(meta.get("c_url") or "").strip() or cfg.c_base_url
-    if not c_url:
-        raise RuntimeError("未配置目标 C：请在 A->B 的封装 meta 里带 c_url，或启动 b-worker 时提供 --c-url")
+    server_url = str(meta.get("server_url") or meta.get("c_url") or "").strip() or cfg.server_base_url
+    if not server_url:
+        raise RuntimeError("未配置目标 server：请在 client->gateway 的封装 meta 里带 server_url，或启动 gateway-worker 时提供 --server-url")
 
-    url = f"{c_url.rstrip('/')}{cfg.recv_endpoint}"
+    url = f"{server_url.rstrip('/')}{cfg.recv_endpoint}"
     payload = env.unpack_payload()
 
-    # 兜底保护：只要要发给 C 的不是 PSK1 AEAD 包，就直接丢弃。
-    # 否则（例如 b-pull 误把某些"非媒体/非密文"任务塞进队列）会导致 C 被大量 400 轰炸。
+    # 兜底保护：只要要发给 server 的不是 PSK1 AEAD 包，就直接丢弃。
+    # 否则（例如 hls-puller 误把某些"非媒体/非密文"任务塞进队列）会导致 server 被大量 400 轰炸。
     if not _looks_like_psk1(payload):
         logging.info(
             "默认转发分支检测到非 PSK1 payload，跳过：session=%s seq=%s bytes=%d",
@@ -469,20 +469,20 @@ async def forward_one(
         "X-Session": env.session_id,
         "X-Seq": str(env.seq),
         "X-T0-MS": str(env.t0_ms),
-        "X-B-SEND-MS": str(send_ms),
+        "X-GW-SEND-MS": str(send_ms),
     }
 
     r = await client.post(url, content=payload, headers=headers)
     if r.status_code != 200:
-        raise RuntimeError(f"C 返回异常: status={r.status_code} body={r.text[:200]}")
+        raise RuntimeError(f"server 返回异常: status={r.status_code} body={r.text[:200]}")
     return True
 
 
-async def run_b_worker(
+async def run_stego_worker(
     *,
     redis_url: str,
     queue_key: str,
-    c_base_url: str,
+    server_base_url: str,
     psk: bytes | None = None,
     link_token: str = "",
     control_host: str = "127.0.0.1",
@@ -493,10 +493,10 @@ async def run_b_worker(
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     rcfg = reliability if reliability is not None else ReliabilityConfig()
-    cfg = BWorkerConfig(
+    cfg = StegoWorkerConfig(
         redis_url=redis_url,
         queue_key=queue_key,
-        c_base_url=c_base_url,
+        server_base_url=server_base_url,
         psk=psk,
         link_token=link_token or "",
         control_host=control_host,
@@ -509,11 +509,11 @@ async def run_b_worker(
     redis = Redis.from_url(redis_url, decode_responses=False)
     await redis.ping()
     logging.info(
-        "B worker [%s] 已连接 Redis: %s (queue=%s) -> %s%s reliability=%s",
+        "gateway worker [%s] 已连接 Redis: %s (queue=%s) -> %s%s reliability=%s",
         cfg.direction_label,
         redis_url,
         queue_key,
-        c_base_url,
+        server_base_url,
         cfg.recv_endpoint,
         rcfg.enabled,
     )
@@ -522,7 +522,7 @@ async def run_b_worker(
         control_runner = None
         watchdog_task = None
         if rcfg.enabled:
-            control_runner = await run_b_control_server(
+            control_runner = await run_control_server(
                 host=control_host,
                 port=control_port,
                 redis=redis,
@@ -537,13 +537,13 @@ async def run_b_worker(
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logging.warning("B worker [%s] BLPOP 异常，1s后重试: %r", cfg.direction_label, e)
+                    logging.warning("gateway worker [%s] BLPOP 异常，1s后重试: %r", cfg.direction_label, e)
                     await asyncio.sleep(1)
                     continue
                 if item is None:
                     continue
                 _, data = item
-                logging.debug("B worker [%s] BLPOP 获取一条消息 len=%d", cfg.direction_label, len(data))
+                logging.debug("gateway worker [%s] BLPOP 获取一条消息 len=%d", cfg.direction_label, len(data))
                 try:
                     env = OverlayEnvelope.from_json_bytes(data)
                     env2 = OverlayEnvelope.pack(
@@ -551,7 +551,7 @@ async def run_b_worker(
                         seq=env.seq,
                         payload=env.unpack_payload(),
                         content_type=env.content_type,
-                        meta={**env.meta, "b_worker_pop_ms": now_ms()},
+                        meta={**env.meta, "gw_worker_pop_ms": now_ms()},
                         t0_ms=env.t0_ms,
                     )
                     forwarded = await forward_one(client, cfg, env2, redis)
@@ -592,4 +592,3 @@ async def run_b_worker(
             if control_runner:
                 await control_runner.cleanup()
             await redis.aclose()
-

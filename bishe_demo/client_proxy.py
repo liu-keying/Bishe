@@ -31,12 +31,14 @@ from .tunnel import CTL_CONNECT, CTL_CONNECTED, CTL_ERROR, CTL_FIN, TunnelCtl, T
 class PendingPullJob:
     seq: int
     t0_ms: int
-    c_url: str
+    server_url: str
+    c_url: str  # backward compat alias
     ua: str
-    a_recv_ms: int
+    client_recv_ms: int
+    a_recv_ms: int  # backward compat alias
     content_type: str
     blob: bytes
-    """入队时 A 的会话 ID；拉片 URL 须与该值一致，媒体出队后 A 会轮换到下一 session。"""
+    """入队时 client 的会话 ID；拉片 URL 须与该值一致，媒体出队后 client 会轮换到下一 session。"""
     emit_session: str = ""
     hls_index: int = 0
     hls_total: int = 1
@@ -63,13 +65,13 @@ def _segment_response(job: PendingPullJob, *, next_session: str | None = None) -
         "X-Bishe-Kind": "media",
         "X-Bishe-Stego": STEGO_METHOD_PSK_HMAC_INPLACE,
         "X-Bishe-Overlay-Phase": (job.overlay_phase or "media").strip(),
-        "X-C-URL": job.c_url,
+        "X-C-URL": job.server_url,
         "X-Session": job.emit_session,
         "X-Seq": str(job.seq),
         "X-T0-MS": str(job.t0_ms),
         "X-Content-Type": job.content_type,
         "X-A-UA": job.ua,
-        "X-A-Recv-MS": str(job.a_recv_ms),
+        "X-A-Recv-MS": str(job.client_recv_ms),
     }
     if next_session:
         headers["X-Next-Session"] = next_session
@@ -207,7 +209,7 @@ def _enqueue(app: web.Application, job: PendingPullJob) -> None:
 
 
 def _remember_for_retry(app: web.Application, job: PendingPullJob) -> None:
-    """B 校验失败时按 session 重传 media 片。"""
+    """网关 校验失败时按 session 重传 media 片。"""
     if job.overlay_phase != "media":
         return
     by_sess = app.get("retry_media_by_session")
@@ -217,7 +219,7 @@ def _remember_for_retry(app: web.Application, job: PendingPullJob) -> None:
     if emit_sess not in by_sess or not isinstance(by_sess.get(emit_sess), list):
         by_sess[emit_sess] = []
     entry = {
-        "c_url": job.c_url,
+        "server_url": job.server_url,
         "content_type": job.content_type,
         "blob": job.blob,
         "hls_index": job.hls_index,
@@ -247,7 +249,9 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
     try:
         session_id: str = request.app["session_id"]
 
-        c_url = (request.query.get("c") or "").strip() or (request.headers.get("X-C-URL", "").strip())
+        server_url = (request.query.get("server") or request.query.get("c") or "").strip() or (
+            request.headers.get("X-C-URL", "").strip()
+        )
 
         segment_parts: list[bytes] = []
         hidden: bytes | None = None
@@ -280,10 +284,10 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
 
         psk: bytes | None = request.app.get("psk")
         if psk is None:
-            return web.json_response({"ok": False, "error": "PSK not ready (start A with --e-url and wait kex)"}, status=503)
+            return web.json_response({"ok": False, "error": "PSK not ready (start client with --control-url and wait kex)"}, status=503)
         if not str(request.app.get("link_token") or "").strip():
             return web.json_response(
-                {"ok": False, "error": "link_token not ready (psk_hmac_inplace requires E kex to obtain token)"},
+                {"ok": False, "error": "link_token not ready (psk_hmac_inplace requires control kex to obtain token)"},
                 status=503,
             )
         link_token = str(request.app.get("link_token") or "").strip()
@@ -370,8 +374,10 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
                 job = PendingPullJob(
                     seq=seq,
                     t0_ms=t0_ms,
-                    c_url=c_url,
+                    server_url=server_url,
+                    c_url=server_url,
                     ua=ua,
+                    client_recv_ms=recv_ms,
                     a_recv_ms=recv_ms,
                     content_type="video/mp2t",
                     blob=blob0,
@@ -402,8 +408,10 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
             job = PendingPullJob(
                 seq=seq,
                 t0_ms=t0_ms,
-                c_url=c_url,
+                server_url=server_url,
+                c_url=server_url,
                 ua=ua,
+                client_recv_ms=recv_ms,
                 a_recv_ms=recv_ms,
                 content_type="video/mp2t",
                 blob=blob,
@@ -436,7 +444,7 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
             "hls_segments": n,
             "last_segment_chunks": media_chunks,
             "chunk_bytes": chunk_sz,
-            "c_url": c_url,
+            "server_url": server_url,
             "extract": {"method": STEGO_METHOD_PSK_HMAC_INPLACE},
             "seq_from": first_seq,
             "seq_to": last_seq,
@@ -451,7 +459,7 @@ async def handle_overlay_embed_hls(request: web.Request) -> web.Response:
         body_out["seq"] = last_seq
         return web.json_response(body_out)
     except Exception as e:
-        logging.exception("A /overlay/embed-hls 处理异常: %r", e)
+        logging.exception("client /overlay/embed-hls 处理异常: %r", e)
         return web.json_response({"ok": False, "error": f"internal error: {e!r}"}, status=500)
 
 
@@ -464,17 +472,17 @@ async def handle_stop_notice(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         body = {}
-    logging.info("A 收到 stop-notice: %s", body)
+    logging.info("client 收到 stop-notice: %s", body)
     return web.json_response({"ok": True})
 
 
 async def handle_error_notice(request: web.Request) -> web.Response:
-    """B 校验失败：按 session 重入队 media。"""
+    """网关 校验失败：按 session 重入队 media。"""
     try:
         body = await request.json()
     except Exception:
         body = {}
-    logging.warning("A 收到 error-notice: %s", body)
+    logging.warning("client 收到 error-notice: %s", body)
 
     sid = str(body.get("session_id") or body.get("emit_session") or body.get("X-Session") or "").strip()
     by_sess = request.app.get("retry_media_by_session") or {}
@@ -506,8 +514,10 @@ async def handle_error_notice(request: web.Request) -> web.Response:
         job_media = PendingPullJob(
             seq=seq,
             t0_ms=t0_ms,
-            c_url=str(m.get("c_url") or ""),
+            server_url=str(m.get("server_url") or m.get("c_url") or ""),
+            c_url=str(m.get("server_url") or m.get("c_url") or ""),
             ua=ua,
+            client_recv_ms=recv_ms,
             a_recv_ms=recv_ms,
             content_type=str(m.get("content_type") or "application/octet-stream"),
             blob=m.get("blob") or b"",
@@ -535,11 +545,11 @@ async def handle_error_notice(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
-# SOCKS5 隧道 —— A 侧（入口代理 + 反向接收）
+# SOCKS5 隧道 —— client 侧（入口代理 + 反向接收）
 # ---------------------------------------------------------------------------
 
 async def handle_recv_tunnel(request: web.Request) -> web.Response:
-    """接收 B-gate 回传的隧道消息（TunnelCtl / TunnelData），写入对应客户端连接。"""
+    """接收 网关 回传的隧道消息（TunnelCtl / TunnelData），写入对应客户端连接。"""
     payload = await request.read()
     psk: bytes | None = request.app.get("psk")
     if psk is None:
@@ -591,7 +601,7 @@ async def handle_recv_tunnel(request: web.Request) -> web.Response:
 
 
 def _embed_tunnel_msg(app: web.Application, payload: bytes, *, is_ctl: bool = False) -> None:
-    """将隧道消息加密后嵌入 A 的 HLS 分片队列。"""
+    """将隧道消息加密后嵌入 client 的 HLS 分片队列。"""
     psk: bytes | None = app.get("psk")
     if psk is None:
         logging.warning("SOCKS5: PSK 未就绪，丢弃隧道消息")
@@ -631,8 +641,10 @@ def _embed_tunnel_msg(app: web.Application, payload: bytes, *, is_ctl: bool = Fa
     job = PendingPullJob(
         seq=seq,
         t0_ms=0,
+        server_url="",
         c_url="",
         ua="socks5",
+        client_recv_ms=0,
         a_recv_ms=0,
         content_type="application/octet-stream",
         blob=blob,
@@ -709,7 +721,7 @@ async def handle_socks_client(
         port = struct.unpack(">H", port_bytes)[0]
         logging.info("SOCKS5 CONNECT: %s:%d", host, port)
 
-        # 生成连接 ID，通过隐匿通道请求 C 建连
+        # 生成连接 ID，通过隐匿通道请求 server 建连
         conn_id = uuid.uuid4().hex
         ready_event = asyncio.Event()
         st = {
@@ -726,11 +738,11 @@ async def handle_socks_client(
 
         await _send_tunnel_ctl(CTL_CONNECT, host=host, port=port)
 
-        # 等待 C 确认建连
+        # 等待 server 确认建连
         try:
             await asyncio.wait_for(ready_event.wait(), timeout=cfg.get("connect_timeout", 30.0))
         except asyncio.TimeoutError:
-            logging.warning("SOCKS5: 等待 C 建连超时 conn=%s", conn_id[:8])
+            logging.warning("SOCKS5: 等待 server 建连超时 conn=%s", conn_id[:8])
             writer.write(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")  # 主机不可达
             await writer.drain()
             writer.close()
@@ -808,20 +820,20 @@ async def _tunnel_cleanup_loop(app: web.Application, idle_timeout_s: float = 300
                     st["writer"].close()
                 except Exception:
                     pass
-                # 通知 C 关闭
+                # 通知 server 关闭
                 ctl = TunnelCtl(conn_id=conn_id, ctl_type=CTL_FIN)
                 _embed_tunnel_msg(app, ctl.to_bytes(), is_ctl=True)
                 logging.info("SOCKS5 空闲超时关闭: conn=%s", conn_id[:8])
 
 
-async def run_a_proxy(
+async def run_client_proxy(
     *,
     host: str,
     port: int,
     session_id: str | None = None,
-    e_url: str = "",
-    c_url: str = "",
-    b_gate_url: str = "",
+    control_url: str = "",
+    server_url: str = "",
+    gateway_url: str = "",
     socks_host: str = "127.0.0.1",
     socks_port: int = 0,
     socks_enabled: bool = False,
@@ -838,22 +850,24 @@ async def run_a_proxy(
     app["tunnel_conns"] = {}
     app["socks_enabled"] = socks_enabled
 
-    e_url2 = (e_url or "").strip()
-    c_url2 = (c_url or "").strip()
-    if e_url2 and c_url2:
-        a_base = f"http://{host}:{port}"
+    control_url2 = (control_url or "").strip()
+    server_url2 = (server_url or "").strip()
+    if control_url2 and server_url2:
+        client_base = f"http://{host}:{port}"
         priv, pub = generate_rsa_keypair(bits=2048)
         pub_b64 = b64e(rsa_pub_to_pem(pub))
-        link = f"{a_base.rstrip('/')}|{c_url2.rstrip('/')}|{STEGO_METHOD_PSK_HMAC_INPLACE}"
+        link = f"{client_base.rstrip('/')}|{server_url2.rstrip('/')}|{STEGO_METHOD_PSK_HMAC_INPLACE}"
         aad = link.encode("utf-8")
         async with httpx.AsyncClient(timeout=10.0, verify=False, trust_env=False) as client:
             while True:
                 r = await client.post(
-                    f"{e_url2.rstrip('/')}/issue",
+                    f"{control_url2.rstrip('/')}/issue",
                     json={
-                        "role": "a",
-                        "a_url": a_base,
-                        "c_url": c_url2,
+                        "role": "client",
+                        "client_url": client_base,
+                        "server_url": server_url2,
+                        "a_url": client_base,
+                        "c_url": server_url2,
                         "extract_method": STEGO_METHOD_PSK_HMAC_INPLACE,
                         "ttl_s": 600,
                         "pubkey": pub_b64,
@@ -862,7 +876,7 @@ async def run_a_proxy(
                 r.raise_for_status()
                 obj = r.json()
                 if obj.get("ok") is not True:
-                    raise SystemExit(f"E /issue failed: {obj!r}")
+                    raise SystemExit(f"control /issue failed: {obj!r}")
                 if obj.get("pending"):
                     await asyncio.sleep(float(obj.get("retry_after_s") or 0.5))
                     continue
@@ -878,20 +892,20 @@ async def run_a_proxy(
                 psk_b64 = b64e(psk)
                 token = str(data.get("token") or "")
                 if not psk_b64:
-                    raise SystemExit(f"E bundle missing psk_b64: {data!r}")
+                    raise SystemExit(f"control bundle missing psk_b64: {data!r}")
                 if not token:
-                    raise SystemExit(f"E bundle missing token: {data!r}")
+                    raise SystemExit(f"control bundle missing token: {data!r}")
                 app["psk"] = b64d(psk_b64)
                 app["link_token"] = token
-                logging.info("A 已从 E 获取 PSK（数据面加密启用）")
-                bg = (b_gate_url or "").strip()
-                if bg:
+                logging.info("client 已从 control 获取 PSK（数据面加密启用）")
+                gw = (gateway_url or "").strip()
+                if gw:
                     rr = await client.post(
-                        f"{bg.rstrip('/')}/register",
-                        json={"role": "a", "token": token, "psk_b64": b64e(psk)},
+                        f"{gw.rstrip('/')}/register",
+                        json={"role": "client", "token": token, "psk_b64": b64e(psk)},
                     )
                     rr.raise_for_status()
-                    logging.info("A 已向 B-gate 注册（role=a）")
+                    logging.info("client 已向 gateway 注册（role=client）")
                 break
 
     app.router.add_get("/health", handle_health)
@@ -907,7 +921,7 @@ async def run_a_proxy(
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)
     logging.info(
-        "A 节点启动(HLS 伪装): http://%s:%d session_id=%s — master / index / seg",
+        "client 节点启动(HLS 伪装): http://%s:%d session_id=%s — master / index / seg",
         host,
         port,
         app["session_id"],

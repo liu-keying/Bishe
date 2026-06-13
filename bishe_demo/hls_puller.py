@@ -13,8 +13,8 @@ from .stego import extract_trailer
 
 
 @dataclass(frozen=True)
-class BPullConfig:
-    a_base_url: str
+class HLSPullerConfig:
+    source_base_url: str
     session_id: str
     redis_url: str
     queue_key: str
@@ -23,25 +23,28 @@ class BPullConfig:
     hls_prefix: str = "/hls"
 
 
-def _envelope_from_get_response(r: httpx.Response, fallback_session: str, a_base_url: str) -> OverlayEnvelope:
+def _envelope_from_get_response(r: httpx.Response, fallback_session: str, source_base_url: str) -> OverlayEnvelope:
     body = r.content
     kind = (r.headers.get("X-Bishe-Kind") or "direct").strip()
     session_id = (r.headers.get("X-Session") or "").strip() or fallback_session
     seq = int(r.headers.get("X-Seq") or "0")
     t0_ms = int(r.headers.get("X-T0-MS") or "0")
-    c_url_hdr = (r.headers.get("X-C-URL") or "").strip()
+    server_url_hdr = (r.headers.get("X-C-URL") or "").strip()
     stego_hdr = (r.headers.get("X-Bishe-Stego") or "").strip()
     ctype = (r.headers.get("X-Content-Type") or "application/octet-stream").strip()
     ua = (r.headers.get("X-A-UA") or "").strip()
-    a_recv_ms = int(r.headers.get("X-A-Recv-MS") or "0")
+    client_recv_ms = int(r.headers.get("X-A-Recv-MS") or "0")
 
-    b_pull_ms = now_ms()
+    pull_ms = now_ms()
     base_meta: dict = {
-        "c_url": c_url_hdr,
-        "a_url": a_base_url,
+        "server_url": server_url_hdr,
+        "c_url": server_url_hdr,
+        "source_url": source_base_url,
+        "a_url": source_base_url,
         "ua": ua,
-        "a_recv_ms": a_recv_ms,
-        "b_pull_ms": b_pull_ms,
+        "client_recv_ms": client_recv_ms,
+        "a_recv_ms": client_recv_ms,
+        "pull_ms": pull_ms,
     }
 
     if kind == "media":
@@ -91,7 +94,8 @@ def _envelope_from_get_response(r: httpx.Response, fallback_session: str, a_base
         raise ValueError("control frames are disabled")
 
     raw = extract_trailer(body)
-    meta = {**base_meta, "c_url": c_url_hdr or base_meta.get("c_url", "")}
+    meta = {**base_meta, "server_url": server_url_hdr or base_meta.get("server_url", ""),
+            "c_url": server_url_hdr or base_meta.get("c_url", "")}
     return OverlayEnvelope.pack(
         session_id=session_id,
         seq=seq,
@@ -102,9 +106,9 @@ def _envelope_from_get_response(r: httpx.Response, fallback_session: str, a_base
     )
 
 
-async def run_b_pull(
+async def run_hls_puller(
     *,
-    a_base_url: str,
+    source_base_url: str,
     session_id: str,
     redis_url: str,
     queue_key: str,
@@ -113,8 +117,8 @@ async def run_b_pull(
     hls_prefix: str = "/hls",
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    cfg = BPullConfig(
-        a_base_url=a_base_url.rstrip("/"),
+    cfg = HLSPullerConfig(
+        source_base_url=source_base_url.rstrip("/"),
         session_id=session_id,
         redis_url=redis_url,
         queue_key=queue_key,
@@ -126,10 +130,10 @@ async def run_b_pull(
     redis = Redis.from_url(redis_url, decode_responses=False)
     await redis.ping()
     live_session = [cfg.session_id]
-    master_url = f"{cfg.a_base_url}{make_hls_master_path(live_session[0], prefix=cfg.hls_prefix)}"
+    master_url = f"{cfg.source_base_url}{make_hls_master_path(live_session[0], prefix=cfg.hls_prefix)}"
     seg_iv = cfg.segment_interval_s
     logging.info(
-        "B pull 启动(类 HLS 客户端): master=%s -> index.m3u8 -> seg-*.ts -> Redis %s "
+        "HLS puller 启动(类 HLS 客户端): master=%s -> index.m3u8 -> seg-*.ts -> Redis %s "
         "(segment_interval_s=%s hls_prefix=%s)",
         master_url,
         cfg.queue_key,
@@ -142,7 +146,7 @@ async def run_b_pull(
         async with httpx.AsyncClient(timeout=120.0, verify=False, trust_env=False) as client:
             while True:
                 if media_playlist_url is None:
-                    master_url = f"{cfg.a_base_url}{make_hls_master_path(live_session[0], prefix=cfg.hls_prefix)}"
+                    master_url = f"{cfg.source_base_url}{make_hls_master_path(live_session[0], prefix=cfg.hls_prefix)}"
                     try:
                         rm = await client.get(master_url)
                     except httpx.HTTPError as e:
@@ -199,7 +203,7 @@ async def run_b_pull(
                         break
 
                     try:
-                        env = _envelope_from_get_response(rs, live_session[0], cfg.a_base_url)
+                        env = _envelope_from_get_response(rs, live_session[0], cfg.source_base_url)
                         await redis.rpush(cfg.queue_key, env.to_json_bytes())
                         env_seq = int(rs.headers.get("X-Seq") or "0")
                         hdr_sess = (rs.headers.get("X-Session") or "").strip() or live_session[0]
@@ -214,7 +218,7 @@ async def run_b_pull(
                             live_session[0] = nxt
                             media_playlist_url = None
                             saw_next_session = True
-                            logging.info("已跟随 A 轮换 session -> %s，将重新 GET master", nxt)
+                            logging.info("已跟随 client 轮换 session -> %s，将重新 GET master", nxt)
                             break
                     except Exception:
                         logging.exception("解析分片响应并入队失败")

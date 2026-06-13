@@ -4,8 +4,8 @@
 
 | 模式 | 说明 |
 |------|------|
-| **隐匿数据注入** | 发送方将任意二进制数据加密嵌入 TS 分片，B 拉流提取后转发 C 解密 |
-| **SOCKS5 代理** | A 作为 SOCKS5 入口，通过隐匿通道透明代理任意 TCP 流量（HTTP/HTTPS/…） |
+| **隐匿数据注入** | 发送方将任意二进制数据加密嵌入 TS 分片，网关拉流提取后转发 服务端 解密 |
+| **SOCKS5 代理** | client 作为 SOCKS5 入口，通过隐匿通道透明代理任意 TCP 流量（HTTP/HTTPS/…） |
 
 ---
 
@@ -13,25 +13,25 @@
 
 | 节点 | 默认端口 | 作用 |
 |------|----------|------|
-| **E** | 8009 | 控制面：A/C 密钥交换（RSA-OAEP + AES-256-GCM），下发 PSK + Token |
-| **B-gate** | 8010 (数据面) / 8011 (控制面) | 数据面网关：A、C 注册后启动双向拉流与转发 |
-| **A** | 8000 (+ SOCKS5 1080) | HLS 源站 + 隐匿嵌入；可选 SOCKS5 代理入口 |
-| **C** | 8002 | 接收端：解密统计；可选 TCP 出口（代理模式） |
+| **control** | 8009 | 控制面：client/server 密钥交换（RSA-OAEP + AES-256-GCM），下发 PSK + Token |
+| **gateway** | 8010 (数据面) / 8011 (控制面) | 数据面网关：client、server 注册后启动双向拉流与转发 |
+| **client** | 8000 (+ SOCKS5 1080) | HLS 源站 + 隐匿嵌入；可选 SOCKS5 代理入口 |
+| **server** | 8002 | 接收端：解密统计；可选 TCP 出口（代理模式） |
 | **Redis** | 6379 | 消息队列 + 密文分片拼装缓冲 |
 
 ### 数据流
 
 ```
-# 模式 1: 隐匿数据注入（单向 A→C）
-发送方 → POST A(/overlay/embed-hls) → A 加密嵌入 TS
-       → B-gate GET A(HLS) → 提取 → POST C(/recv) → C 解密
+# 模式 1: 隐匿数据注入（单向 client→server）
+发送方 → POST client(/overlay/embed-hls) → client 加密嵌入 TS
+       → gateway GET client(HLS) → 提取 → POST server(/recv) → server 解密
 
 # 模式 2: SOCKS5 代理（双向）
-客户端 → SOCKS5 A → 正向 HLS(/hls) → B-gate → POST C(/recv)
+客户端 → SOCKS5 client → 正向 HLS(/hls) → gateway → POST server(/recv)
                                                       ↓
-                                                  C → TCP → 目标
+                                                  server → TCP → 目标
                                                       ↓
-客户端 ← A ← B-gate ← 反向 HLS(/hls-rev) ← C 嵌入响应 ←┘
+客户端 ← client ← gateway ← 反向 HLS(/hls-rev) ← server 嵌入响应 ←┘
 ```
 
 ---
@@ -59,23 +59,23 @@ docker run --rm -p 6379:6379 redis:7
 # 1) Redis
 docker run --rm -p 6379:6379 redis:7
 
-# 2) E（控制面）
-python main.py e --host 127.0.0.1 --port 8009 --token-secret bishe-dev-secret
+# 2) control（控制面）
+python main.py control --host 127.0.0.1 --port 8009 --token-secret bishe-dev-secret
 
-# 3) B-gate
-python main.py b-gate --host 127.0.0.1 --port 8010 \
+# 3) gateway
+python main.py gateway --host 127.0.0.1 --port 8010 \
   --redis redis://127.0.0.1:6379/0 --queue bishe:overlay:queue \
   --token-secret bishe-dev-secret
 
-# 4) C（接收端）
-python main.py c --host 127.0.0.1 --port 8002 \
-  --e-url http://127.0.0.1:8009 --a-url http://127.0.0.1:8000 \
-  --b-gate-url http://127.0.0.1:8010
+# 4) server（接收端）
+python main.py server --host 127.0.0.1 --port 8002 \
+  --control-url http://127.0.0.1:8009 --client-url http://127.0.0.1:8000 \
+  --gateway-url http://127.0.0.1:8010
 
-# 5) A（源站）
-python main.py a --host 127.0.0.1 --port 8000 --session bishe-1 \
-  --e-url http://127.0.0.1:8009 --c-url http://127.0.0.1:8002 \
-  --b-gate-url http://127.0.0.1:8010
+# 5) client（源站）
+python main.py client --host 127.0.0.1 --port 8000 --session bishe-1 \
+  --control-url http://127.0.0.1:8009 --server-url http://127.0.0.1:8002 \
+  --gateway-url http://127.0.0.1:8010
 ```
 
 ### 发送隐匿数据
@@ -106,7 +106,7 @@ curl http://127.0.0.1:8002/stats
 
 ## 模式 2：SOCKS5 代理
 
-A 启动时加 `--socks-port` 即可开启 SOCKS5 代理，通过隐匿通道透明转发任意 TCP 流量。
+client 启动时加 `--socks-port` 即可开启 SOCKS5 代理，通过隐匿通道透明转发任意 TCP 流量。
 
 ### 启动
 
@@ -114,26 +114,26 @@ A 启动时加 `--socks-port` 即可开启 SOCKS5 代理，通过隐匿通道透
 # 1) Redis
 docker run --rm -p 6379:6379 redis:7
 
-# 2) E
-python main.py e --host 127.0.0.1 --port 8009 --token-secret bishe-dev-secret
+# 2) control
+python main.py control --host 127.0.0.1 --port 8009 --token-secret bishe-dev-secret
 
-# 3) B-gate（需要两个 Redis 队列：正向 + 反向）
-python main.py b-gate --host 127.0.0.1 --port 8010 \
+# 3) gateway（需要两个 Redis 队列：正向 + 反向）
+python main.py gateway --host 127.0.0.1 --port 8010 \
   --redis redis://127.0.0.1:6379/0 \
   --queue bishe:overlay:queue \
   --queue-rev bishe:overlay:queue:rev \
   --token-secret bishe-dev-secret
 
-# 4) C（出口节点，向目标发起真实 TCP 连接）
-python main.py c --host 127.0.0.1 --port 8002 \
-  --e-url http://127.0.0.1:8009 --a-url http://127.0.0.1:8000 \
-  --b-gate-url http://127.0.0.1:8010
+# 4) server（出口节点，向目标发起真实 TCP 连接）
+python main.py server --host 127.0.0.1 --port 8002 \
+  --control-url http://127.0.0.1:8009 --client-url http://127.0.0.1:8000 \
+  --gateway-url http://127.0.0.1:8010
 
-# 5) A（入口节点，--socks-port 1080 开启 SOCKS5 代理）
-python main.py a --host 127.0.0.1 --port 8000 --socks-port 1080 \
+# 5) client（入口节点，--socks-port 1080 开启 SOCKS5 代理）
+python main.py client --host 127.0.0.1 --port 8000 --socks-port 1080 \
   --session bishe-1 \
-  --e-url http://127.0.0.1:8009 --c-url http://127.0.0.1:8002 \
-  --b-gate-url http://127.0.0.1:8010
+  --control-url http://127.0.0.1:8009 --server-url http://127.0.0.1:8002 \
+  --gateway-url http://127.0.0.1:8010
 ```
 
 ### 使用
@@ -154,45 +154,189 @@ curl --socks5 127.0.0.1:1080 https://www.example.com
 |------|--------|------|
 | `--socks-port` | `0` | SOCKS5 端口，0=禁用 |
 | `--socks-listen` | `127.0.0.1` | SOCKS5 监听地址 |
-| `--no-socks` | `false` | 显式禁用 SOCKS5（A/C 角色） |
+| `--no-socks` | `false` | 显式禁用 SOCKS5（client/server 角色） |
 | `--queue-rev` | `bishe:overlay:queue:rev` | 反向 Redis 队列 key |
 | `--socks-buffer-size` | `32768` | TCP 读缓冲字节数 |
-| `--socks-connect-timeout` | `30` | 等待 C 建连超时秒数 |
+| `--socks-connect-timeout` | `30` | 等待 server 建连超时秒数 |
 | `--socks-idle-timeout` | `300` | 空闲连接超时秒数 |
 | `--socks-max-conns` | `50` | 最大并发隧道连接数 |
 
 ---
 
-## C 使用 HTTPS（可选）
+## 分布式部署
+
+各节点可部署在不同主机上，只需保证网络互通。以下为典型部署指南。
+
+### 网络连通性
+
+| 节点 | 需要被谁访问 | 需要访问谁 |
+|------|-------------|-----------|
+| **control** | client、server | 无 |
+| **gateway** | client、server（注册/拉流） | client、server、Redis |
+| **client** | gateway（拉流）、发送方（/overlay/embed-hls） | control、gateway |
+| **server** | gateway（转发 /recv） | control、gateway、（目标 TCP） |
+| **Redis** | gateway | 无 |
+
+### 通用注意事项
+
+- `--token-secret` 在 **control** 和 **gateway** 上必须一致
+- `--host` 设为 `0.0.0.0` 监听所有网卡，或指定实际 IP
+- `--control-url`、`--client-url`、`--server-url`、`--gateway-url` 使用对方可达的实际 IP/域名
+- `--redis` 使用 gateway 可达的 Redis 地址
+- 确保防火墙开放对应端口
+
+### 示例一：两台机器（隐匿数据注入）
+
+**机器 A**（`10.0.0.1`）：control + gateway + Redis  
+**机器 B**（`10.0.0.2`）：client + server
+
+```bash
+# ===== 机器 A: 10.0.0.1 =====
+# 1) Redis
+docker run -d --restart unless-stopped -p 6379:6379 redis:7
+
+# 2) control
+python main.py control --host 0.0.0.0 --port 8009 --token-secret bishe-dev-secret
+
+# 3) gateway（注：Redis 用本机地址，control/gateway 本身也在本机）
+python main.py gateway --host 0.0.0.0 --port 8010 \
+  --redis redis://127.0.0.1:6379/0 --queue bishe:overlay:queue \
+  --token-secret bishe-dev-secret
+
+# ===== 机器 B: 10.0.0.2 =====
+# 4) server（所有 URL 指向机器 A 的对应服务）
+python main.py server --host 0.0.0.0 --port 8002 \
+  --control-url http://10.0.0.1:8009 --client-url http://10.0.0.2:8000 \
+  --gateway-url http://10.0.0.1:8010
+
+# 5) client
+python main.py client --host 0.0.0.0 --port 8000 --session bishe-1 \
+  --control-url http://10.0.0.1:8009 --server-url http://10.0.0.2:8002 \
+  --gateway-url http://10.0.0.1:8010
+```
+
+### 示例二：三台机器（SOCKS5 代理）
+
+**机器 A**（`10.0.0.1`）：gateway + Redis  
+**机器 B**（`10.0.0.2`）：client（SOCKS5 入口）  
+**机器 C**（`10.0.0.3`）：server + control
+
+```bash
+# ===== 机器 A: 10.0.0.1 (gateway) =====
+docker run -d --restart unless-stopped -p 6379:6379 redis:7
+
+python main.py gateway --host 0.0.0.0 --port 8010 \
+  --redis redis://127.0.0.1:6379/0 \
+  --queue bishe:overlay:queue \
+  --queue-rev bishe:overlay:queue:rev \
+  --token-secret bishe-dev-secret
+
+# ===== 机器 B: 10.0.0.2 (client) =====
+python main.py client --host 0.0.0.0 --port 8000 --socks-port 1080 \
+  --session bishe-1 \
+  --control-url http://10.0.0.3:8009 \
+  --server-url http://10.0.0.3:8002 \
+  --gateway-url http://10.0.0.1:8010
+
+# ===== 机器 C: 10.0.0.3 (control + server) =====
+python main.py control --host 0.0.0.0 --port 8009 --token-secret bishe-dev-secret
+
+python main.py server --host 0.0.0.0 --port 8002 \
+  --control-url http://10.0.0.3:8009 \
+  --client-url http://10.0.0.2:8000 \
+  --gateway-url http://10.0.0.1:8010
+```
+
+在机器 B 或同一网络的任意主机上使用 SOCKS5 代理：
+
+```bash
+curl --socks5 10.0.0.2:1080 http://httpbin.org/get
+```
+
+### 示例三：完全分布式 + HTTPS
+
+所有节点各占一台机器，server 启用 HTTPS。
+
+**机器 A**（`10.0.0.1`）：control  
+**机器 B**（`10.0.0.2`）：gateway + Redis  
+**机器 C**（`10.0.0.3`）：client  
+**机器 D**（`10.0.0.4`）：server（HTTPS）
+
+```bash
+# ===== 机器 A: control =====
+python main.py control --host 0.0.0.0 --port 8009 --token-secret bishe-dev-secret
+
+# ===== 机器 B: gateway + Redis =====
+docker run -d --restart unless-stopped -p 6379:6379 redis:7
+
+python main.py gateway --host 0.0.0.0 --port 8010 \
+  --redis redis://127.0.0.1:6379/0 \
+  --queue bishe:overlay:queue \
+  --queue-rev bishe:overlay:queue:rev \
+  --token-secret bishe-dev-secret \
+  --gateway-callback-url http://10.0.0.2:8011/overlay/recv-ack
+
+# ===== 机器 C: client =====
+python main.py client --host 0.0.0.0 --port 8000 --socks-port 1080 \
+  --session bishe-1 \
+  --control-url http://10.0.0.1:8009 \
+  --server-url https://10.0.0.4:8443 \
+  --gateway-url http://10.0.0.2:8010
+
+# ===== 机器 D: server (HTTPS) =====
+# 先生成证书
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+  -days 365 -nodes -subj "/CN=10.0.0.4"
+
+python main.py server --host 0.0.0.0 --port 8443 \
+  --ssl-cert cert.pem --ssl-key key.pem \
+  --control-url http://10.0.0.1:8009 \
+  --client-url http://10.0.0.3:8000 \
+  --gateway-url http://10.0.0.2:8010 \
+  --gateway-callback-url http://10.0.0.2:8011/overlay/recv-ack
+```
+
+### 部署策略参考
+
+| 场景 | 推荐部署方式 |
+|------|-------------|
+| 本地开发/调试 | 全部 localhost + 5 个终端 |
+| 内网穿透测试 | Redis + gateway + control 在一台；client 和 server 分置两端 |
+| 公网隐匿代理 | client 在本地 PC；gateway + Redis 在跳板 VPS；server + control 在出口 VPS |
+| 最小延迟 | Redis 与 gateway 同机部署；control 可合设于 gateway 或 server |
+
+---
+
+## server 使用 HTTPS（可选）
 
 ```bash
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
 
-python main.py c --host 127.0.0.1 --port 8443 --ssl-cert cert.pem --ssl-key key.pem \
-  --e-url http://127.0.0.1:8009 --a-url http://127.0.0.1:8000 \
-  --b-gate-url http://127.0.0.1:8010
+python main.py server --host 127.0.0.1 --port 8443 --ssl-cert cert.pem --ssl-key key.pem \
+  --control-url http://127.0.0.1:8009 --client-url http://127.0.0.1:8000 \
+  --gateway-url http://127.0.0.1:8010
 ```
 
-A 的 `--c-url` 相应改为 `https://127.0.0.1:8443`。
+client 的 `--server-url` 相应改为 `https://127.0.0.1:8443`。
 
 ---
 
 ## 可靠性回执（可选）
 
-C 解密后通知 B，B 超时重发：
+server 解密后通知 gateway，gateway 超时重发：
 
 ```bash
-# C 加 --b-callback-url
-python main.py c ... --b-callback-url http://127.0.0.1:8011/overlay/recv-ack
+# server 加 --gateway-callback-url
+python main.py server ... --gateway-callback-url http://127.0.0.1:8011/overlay/recv-ack
 
-# B-gate 不加 --no-reliability（默认启用可靠性）
-python main.py b-gate ...
+# gateway 不加 --no-reliability（默认启用可靠性）
+python main.py gateway ...
 ```
 
 关闭可靠性（简单演示用）：
 
 ```bash
-python main.py b-gate ... --no-reliability
+python main.py gateway ... --no-reliability
 ```
 
 ---
@@ -202,7 +346,7 @@ python main.py b-gate ... --no-reliability
 ```bash
 curl -X POST http://127.0.0.1:8010/stop \
   -H "Content-Type: application/json" \
-  -d '{"role":"a","token":"<token>"}'
+  -d '{"role":"client","token":"<token>"}'
 ```
 
 ---
@@ -211,12 +355,12 @@ curl -X POST http://127.0.0.1:8010/stop \
 
 | 服务 | 默认端口 |
 |------|----------|
-| A | 8000 |
-| A (SOCKS5) | 1080 |
-| C | 8002 |
-| E | 8009 |
-| B-gate | 8010 |
-| B-gate 控制面 | 8011 |
+| client | 8000 |
+| client (SOCKS5) | 1080 |
+| server | 8002 |
+| control | 8009 |
+| gateway | 8010 |
+| gateway 控制面 | 8011 |
 | Redis | 6379 |
 
 ---
@@ -225,15 +369,15 @@ curl -X POST http://127.0.0.1:8010/stop \
 
 ```
 bishe_demo/
-├── tunnel.py          # SOCKS5 隧道数据模型 + C 侧 TCP 出口
-├── hls_shared.py      # 共享 HLS 服务（A 正向 /hls、C 反向 /hls-rev 复用）
-├── a_client_proxy.py  # A 节点：HLS 源站 + 隐匿嵌入 + SOCKS5 入口
-├── b_gate_pull.py     # B-gate：注册编排，启动双向 pull+worker
-├── b_pull.py          # B-pull：HLS 客户端拉流
-├── b_worker.py        # B-worker：stego 提取 + 密文拼装 + 转发
-├── b_reliability.py   # 可靠性：C 回执、超时重发
-├── c_server.py        # C 节点：接收解密 + 反向 HLS + TCP 出口
-├── e_server.py        # E 节点：密钥协商 + token 签发
+├── tunnel.py          # SOCKS5 隧道数据模型 + server 侧 TCP 出口
+├── hls_shared.py      # 共享 HLS 服务（client 正向 /hls、server 反向 /hls-rev 复用）
+├── client_proxy.py    # client 节点：HLS 源站 + 隐匿嵌入 + SOCKS5 入口
+├── gateway.py         # gateway：注册编排，启动双向 pull+worker
+├── hls_puller.py      # HLS 拉流客户端
+├── stego_worker.py    # stego 提取 + 密文拼装 + 转发
+├── reliability.py     # 可靠性：server 回执、超时重发
+├── server.py          # server 节点：接收解密 + 反向 HLS + TCP 出口
+├── control_server.py  # control 节点：密钥协商 + token 签发
 ├── stego.py           # 隐匿嵌入/提取算法（psk_hmac_inplace）
 ├── psk_aead.py        # PSK1 格式 AEAD 加解密
 ├── crypto_box.py      # RSA 密钥对、OAEP 封装、AEAD
@@ -261,11 +405,11 @@ main.py                # 统一入口
 
 ### SOCKS5 隧道
 
-- 握手阶段通过正向 HLS 发送 `TunnelCtl(connect)` 到 C
-- C 建立到目标的 TCP 连接后通过反向 HLS 回传 `TunnelCtl(connected)`
+- 握手阶段通过正向 HLS 发送 `TunnelCtl(connect)` 到 server
+- server 建立到目标的 TCP 连接后通过反向 HLS 回传 `TunnelCtl(connected)`
 - 数据阶段：双向 TCP 字节流经 PSK1 AEAD 加密后嵌入 HLS 分片转发
 - 每个 TCP 连接分配唯一 `conn_id`（UUID），贯穿正反向通道
 
 ### 会话管理
 
-A 每消费一片分片递增 `session_id`（`bishe-1` → `bishe-2` → …），B-gate 通过 `X-Next-Session` 响应头自动跟随轮换。
+client 每消费一片分片递增 `session_id`（`bishe-1` → `bishe-2` → …），gateway 通过 `X-Next-Session` 响应头自动跟随轮换。

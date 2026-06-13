@@ -47,7 +47,7 @@ def _percentile(sorted_vals: list[float], p: float) -> float | None:
     return float(sorted_vals[k - 1])
 
 
-async def _notify_b_recv_ack(
+async def _notify_gateway_recv_ack(
     app: web.Application,
     *,
     delivery_id: str,
@@ -56,8 +56,8 @@ async def _notify_b_recv_ack(
     reason: str = "",
     detail: str = "",
 ) -> None:
-    b_url = str(app.get("b_callback_url") or "").strip()
-    if not b_url:
+    gw_url = str(app.get("gateway_callback_url") or "").strip()
+    if not gw_url:
         return
     body = {
         "delivery_id": delivery_id,
@@ -68,20 +68,20 @@ async def _notify_b_recv_ack(
     }
     try:
         async with httpx.AsyncClient(timeout=10.0, verify=False, trust_env=False) as client:
-            await client.post(b_url, json=body, headers={"X-Overlay": "1"})
+            await client.post(gw_url, json=body, headers={"X-Overlay": "1"})
     except Exception:
-        logging.exception("C -> B recv-ack 失败 delivery_id=%s ok=%s", delivery_id, ok)
+        logging.exception("server -> gateway recv-ack 失败 delivery_id=%s ok=%s", delivery_id, ok)
 
 
 def _embed_to_rev_hls(app: web.Application, payload: bytes) -> None:
-    """将隧道响应消息加密后嵌入 C 的反向 HLS 分片队列。
+    """将隧道响应消息加密后嵌入 server 的反向 HLS 分片队列。
 
-    使用与 A 相同的 psk_hmac_inplace 方法。
+    使用与 client 相同的 psk_hmac_inplace 方法。
     """
     psk: bytes | None = app.get("psk")
     link_token = str(app.get("link_token") or "").strip()
     if psk is None or not link_token:
-        logging.warning("SOCKS5(C): PSK/link_token 未就绪，丢弃反向消息")
+        logging.warning("SOCKS5(server): PSK/link_token 未就绪，丢弃反向消息")
         return
 
     session_id = str(app.get("session_id_rev") or "")
@@ -107,7 +107,7 @@ def _embed_to_rev_hls(app: web.Application, payload: bytes) -> None:
             cipher_fragment=part,
         )
     except Exception as e:
-        logging.warning("SOCKS5(C): embed 失败: %r", e)
+        logging.warning("SOCKS5(server): embed 失败: %r", e)
         return
 
     # PendingPullJob 需要这些字段，这里构造最小版本
@@ -117,8 +117,10 @@ def _embed_to_rev_hls(app: web.Application, payload: bytes) -> None:
     class _RevJob:
         seq: int = 0
         t0_ms: int = 0
+        server_url: str = ""
         c_url: str = ""
         ua: str = "rev"
+        client_recv_ms: int = 0
         a_recv_ms: int = 0
         content_type: str = "application/octet-stream"
         blob: bytes = b""
@@ -143,7 +145,7 @@ def _embed_to_rev_hls(app: web.Application, payload: bytes) -> None:
         stego_frag_body_len=g_bytes,
     )
     app["pull_queue_rev"].append(job)
-    logging.debug("SOCKS5(C): 响应已入反向 HLS 队列 seq=%d bytes=%d", seq, len(hidden))
+    logging.debug("SOCKS5(server): 响应已入反向 HLS 队列 seq=%d bytes=%d", seq, len(hidden))
 
 
 async def _tunnel_read_loop(app: web.Application) -> None:
@@ -188,7 +190,7 @@ async def handle_recv(request: web.Request) -> web.Response:
     payload = await request.read()
     psk: bytes | None = request.app.get("psk")
     if psk is None:
-        return web.json_response({"ok": False, "error": "PSK not ready (start C with --e-url and wait kex)"}, status=503)
+        return web.json_response({"ok": False, "error": "PSK not ready (start server with --control-url and wait kex)"}, status=503)
 
     delivery_id_hdr = str(request.headers.get("X-Delivery-Id", "") or "").strip()
     session_id_hdr = str(request.headers.get("X-Session", "") or "")
@@ -197,7 +199,7 @@ async def handle_recv(request: web.Request) -> web.Response:
     if delivery_id_hdr and delivery_id_hdr in delivered:
         if delivery_id_hdr:
             asyncio.create_task(
-                _notify_b_recv_ack(
+                _notify_gateway_recv_ack(
                     request.app,
                     delivery_id=delivery_id_hdr,
                     ok=True,
@@ -216,7 +218,7 @@ async def handle_recv(request: web.Request) -> web.Response:
     except Exception as e:
         if delivery_id_hdr:
             asyncio.create_task(
-                _notify_b_recv_ack(
+                _notify_gateway_recv_ack(
                     request.app,
                     delivery_id=delivery_id_hdr,
                     ok=False,
@@ -236,11 +238,11 @@ async def handle_recv(request: web.Request) -> web.Response:
     # 以下为原有隐匿数据处理
     payload = plain
     t0_ms = int(request.headers.get("X-T0-MS", "0") or "0")
-    b_send_ms = int(request.headers.get("X-B-SEND-MS", "0") or "0")
+    gw_send_ms = int(request.headers.get("X-GW-SEND-MS", "0") or "0")
     t_recv = now_ms()
 
     e2e_ms = (t_recv - t0_ms) if t0_ms else None
-    b2c_ms = (t_recv - b_send_ms) if b_send_ms else None
+    gw2server_ms = (t_recv - gw_send_ms) if gw_send_ms else None
 
     session_id = request.headers.get("X-Session", "")
     seq = request.headers.get("X-Seq", "")
@@ -264,18 +266,18 @@ async def handle_recv(request: web.Request) -> web.Response:
             seen.add(msg_id)
 
     logging.info(
-        "C 收到 session=%s seq=%s bytes=%d e2e_ms=%s b2c_ms=%s",
+        "server 收到 session=%s seq=%s bytes=%d e2e_ms=%s gw2server_ms=%s",
         session_id,
         seq,
         len(payload),
         e2e_ms,
-        b2c_ms,
+        gw2server_ms,
     )
 
     if delivery_id_hdr:
         delivered.add(delivery_id_hdr)
         asyncio.create_task(
-            _notify_b_recv_ack(
+            _notify_gateway_recv_ack(
                 request.app,
                 delivery_id=delivery_id_hdr,
                 ok=True,
@@ -292,13 +294,13 @@ async def handle_recv(request: web.Request) -> web.Response:
             "bytes": len(payload),
             "t_recv_ms": t_recv,
             "e2e_ms": e2e_ms,
-            "b2c_ms": b2c_ms,
+            "gw2server_ms": gw2server_ms,
         }
     )
 
 
 async def _handle_tunnel_ctl(request: web.Request, plain: bytes) -> web.Response:
-    """处理隧道控制消息（C 侧）。"""
+    """处理隧道控制消息（server 侧）。"""
     ctl = TunnelCtl.from_bytes(plain)
     if ctl is None:
         return web.json_response({"ok": False, "error": "bad tunnel ctl"}, status=400)
@@ -325,7 +327,7 @@ async def _handle_tunnel_ctl(request: web.Request, plain: bytes) -> web.Response
 
 
 async def _handle_tunnel_data(request: web.Request, plain: bytes) -> web.Response:
-    """处理隧道数据消息（C 侧）：写入目标 TCP 连接。"""
+    """处理隧道数据消息（server 侧）：写入目标 TCP 连接。"""
     td = TunnelData.from_bytes(plain)
     if td is None:
         return web.json_response({"ok": False, "error": "bad tunnel data"}, status=400)
@@ -403,21 +405,21 @@ async def handle_stop_notice(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         body = {}
-    logging.info("C 收到 stop-notice: %s", body)
+    logging.info("server 收到 stop-notice: %s", body)
     return web.json_response({"ok": True})
 
 
-async def run_c_server(
+async def run_server(
     *,
     host: str,
     port: int,
     ssl_certfile: str | None = None,
     ssl_keyfile: str | None = None,
-    e_url: str = "",
-    a_url: str = "",
-    b_gate_url: str = "",
+    control_url: str = "",
+    client_url: str = "",
+    gateway_url: str = "",
     psk_hex: str = "",
-    b_callback_url: str = "",
+    gateway_callback_url: str = "",
     socks_enabled: bool = False,
     socks_max_conns: int = 50,
     socks_idle_timeout: float = 300.0,
@@ -429,16 +431,16 @@ async def run_c_server(
     app["stats"] = {"start_ms": now_ms(), "recv_count": 0, "dup_count": 0, "recv_bytes": 0, "events": [], "seen_msg_ids": set()}
     app["psk"] = None
     app["link_token"] = ""
-    app["b_callback_url"] = (b_callback_url or "").strip()
-    if app["b_callback_url"]:
-        logging.info("C 启用 B 回执: %s", app["b_callback_url"])
+    app["gateway_callback_url"] = (gateway_callback_url or "").strip()
+    if app["gateway_callback_url"]:
+        logging.info("server 启用 gateway 回执: %s", app["gateway_callback_url"])
 
-    # SOCKS5 隧道状态（C 侧出口）
+    # SOCKS5 隧道状态（server 侧出口）
     app["tunnel_exit"] = TunnelExit(max_conns=socks_max_conns, idle_timeout_s=socks_idle_timeout)
     app["tunnel_enabled"] = socks_enabled
     app["tunnel_seq_rev"]: dict[str, int] = {}
 
-    # 反向 HLS 状态（C 提供 HLS 服务，供 B-gate 拉取响应数据回传 A）
+    # 反向 HLS 状态（server 提供 HLS 服务，供 gateway 拉取响应数据回传 client）
     setup_hls_state(app, "bishe-rev-1")
     # 覆盖为固定 session ID（"bishe-rev-1" 不符合 bishe-<N> 格式，setup_hls_state 解析后会变成 bishe-1）
     app["session_id"] = "bishe-rev-1"
@@ -447,32 +449,34 @@ async def run_c_server(
     app["pull_queue_rev"] = app["pull_queue"]   # 别名，供 _embed_to_rev_hls 使用
 
     if socks_enabled:
-        logging.info("C 启用 SOCKS5 隧道出口 (max_conns=%d)", socks_max_conns)
+        logging.info("server 启用 SOCKS5 隧道出口 (max_conns=%d)", socks_max_conns)
 
     psk_hex2 = (psk_hex or "").strip()
     if psk_hex2:
         if len(psk_hex2) != 64:
             raise SystemExit("--psk-hex 须为 64 位十六进制（32 字节 AES-256 密钥）")
         app["psk"] = bytes.fromhex(psk_hex2)
-        logging.info("C 使用静态 PSK（--psk-hex / BISHE_PSK_HEX）")
+        logging.info("server 使用静态 PSK（--psk-hex / BISHE_PSK_HEX）")
 
-    e_url2 = (e_url or "").strip()
-    a_url2 = (a_url or "").strip()
-    if e_url2 and a_url2:
+    control_url2 = (control_url or "").strip()
+    client_url2 = (client_url or "").strip()
+    if control_url2 and client_url2:
         scheme = "https" if ssl_certfile and ssl_keyfile else "http"
-        c_base = f"{scheme}://{host}:{port}"
+        server_base = f"{scheme}://{host}:{port}"
         priv, pub = generate_rsa_keypair(bits=2048)
         pub_b64 = b64e(rsa_pub_to_pem(pub))
-        link = f"{a_url2.rstrip('/')}|{c_base.rstrip('/')}|{STEGO_METHOD_PSK_HMAC_INPLACE}"
+        link = f"{client_url2.rstrip('/')}|{server_base.rstrip('/')}|{STEGO_METHOD_PSK_HMAC_INPLACE}"
         aad = link.encode("utf-8")
         async with httpx.AsyncClient(timeout=10.0, verify=False, trust_env=False) as client:
             while True:
                 r = await client.post(
-                    f"{e_url2.rstrip('/')}/issue",
+                    f"{control_url2.rstrip('/')}/issue",
                     json={
-                        "role": "c",
-                        "a_url": a_url2,
-                        "c_url": c_base,
+                        "role": "server",
+                        "client_url": client_url2,
+                        "server_url": server_base,
+                        "a_url": client_url2,
+                        "c_url": server_base,
                         "extract_method": STEGO_METHOD_PSK_HMAC_INPLACE,
                         "ttl_s": 600,
                         "pubkey": pub_b64,
@@ -481,7 +485,7 @@ async def run_c_server(
                 r.raise_for_status()
                 obj = r.json()
                 if obj.get("ok") is not True:
-                    raise SystemExit(f"E /issue failed: {obj!r}")
+                    raise SystemExit(f"control /issue failed: {obj!r}")
                 if obj.get("pending"):
                     await asyncio.sleep(float(obj.get("retry_after_s") or 0.5))
                     continue
@@ -497,20 +501,20 @@ async def run_c_server(
                 psk_b64 = b64e(psk)
                 token = str(data.get("token") or "")
                 if not psk_b64:
-                    raise SystemExit(f"E bundle missing psk_b64: {data!r}")
+                    raise SystemExit(f"control bundle missing psk_b64: {data!r}")
                 if not token:
-                    raise SystemExit(f"E bundle missing token: {data!r}")
+                    raise SystemExit(f"control bundle missing token: {data!r}")
                 app["psk"] = b64d(psk_b64)
                 app["link_token"] = token
-                logging.info("C 已从 E 获取 PSK（数据面解密启用）")
-                bg = (b_gate_url or "").strip()
-                if bg:
+                logging.info("server 已从 control 获取 PSK（数据面解密启用）")
+                gw = (gateway_url or "").strip()
+                if gw:
                     rr = await client.post(
-                        f"{bg.rstrip('/')}/register",
-                        json={"role": "c", "token": token, "psk_b64": b64e(app["psk"])},
+                        f"{gw.rstrip('/')}/register",
+                        json={"role": "server", "token": token, "psk_b64": b64e(app["psk"])},
                     )
                     rr.raise_for_status()
-                    logging.info("C 已向 B-gate 注册（role=c）")
+                    logging.info("server 已向 gateway 注册（role=server）")
                 break
     app.router.add_post("/recv", handle_recv)
     app.router.add_get("/stats", handle_stats)
@@ -518,7 +522,7 @@ async def run_c_server(
     app.router.add_get("/health", handle_health)
     app.router.add_post("/stop-notice", handle_stop_notice)
 
-    # 反向 HLS 路由（供 B-gate 拉取 C→A 响应数据）
+    # 反向 HLS 路由（供 gateway 拉取 server→client 响应数据）
     register_hls_routes(app, "/hls-rev")
 
     runner = web.AppRunner(app)
@@ -533,7 +537,7 @@ async def run_c_server(
 
     site = web.TCPSite(runner, host=host, port=port, ssl_context=ssl_ctx)
     scheme = "https" if ssl_ctx else "http"
-    logging.info("C 服务端启动: %s://%s:%d (recv + rev-hls + stats)", scheme, host, port)
+    logging.info("server 服务端启动: %s://%s:%d (recv + rev-hls + stats)", scheme, host, port)
     await site.start()
 
     # 隧道读循环（持续从目标 TCP 读取响应数据）
@@ -542,4 +546,3 @@ async def run_c_server(
 
     while True:
         await asyncio.sleep(3600)
-

@@ -19,23 +19,33 @@ def _b64url_decode(s: str) -> bytes:
 
 @dataclass(frozen=True)
 class TokenClaims:
-    a_url: str
-    c_url: str
+    client_url: str
+    server_url: str
     extract_method: str
     exp_ms: int
+
+    @property
+    def a_url(self) -> str:
+        """向后兼容别名"""
+        return self.client_url
+
+    @property
+    def c_url(self) -> str:
+        """向后兼容别名"""
+        return self.server_url
 
     def is_expired(self) -> bool:
         return int(time.time() * 1000) > int(self.exp_ms)
 
 
 def issue_token(
-    *, secret: str, a_url: str, c_url: str, extract_method: str, ttl_s: int = 600
+    *, secret: str, client_url: str, server_url: str, extract_method: str, ttl_s: int = 600
 ) -> str:
     exp_ms = int(time.time() * 1000) + int(ttl_s) * 1000
     payload = {
         "v": 1,
-        "a_url": a_url,
-        "c_url": c_url,
+        "a_url": client_url,
+        "c_url": server_url,
         "extract_method": extract_method,
         "exp_ms": exp_ms,
     }
@@ -56,14 +66,13 @@ def verify_token(*, secret: str, token: str) -> TokenClaims:
         raise ValueError("invalid token signature")
     obj = json.loads(body.decode("utf-8"))
     claims = TokenClaims(
-        a_url=str(obj.get("a_url") or ""),
-        c_url=str(obj.get("c_url") or ""),
+        client_url=str(obj.get("a_url") or ""),
+        server_url=str(obj.get("c_url") or ""),
         extract_method=str(obj.get("extract_method") or ""),
         exp_ms=int(obj.get("exp_ms") or 0),
     )
-    if not claims.a_url:
-        raise ValueError("missing a_url")
+    if not claims.client_url:
+        raise ValueError("missing client_url")
     if claims.is_expired():
         raise ValueError("token expired")
     return claims
-

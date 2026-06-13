@@ -51,6 +51,86 @@ docker run --rm -p 6379:6379 redis:7
 
 ---
 
+## 分布式部署（deploy.py）
+
+单机开发可以手动开 5 个终端。**多机部署**使用 `deploy.py`，一条命令完成全部操作。
+
+### 快速开始
+
+```bash
+# 1. 复制示例配置，修改 IP
+cp deploy_config.example.json deploy_config.json
+vim deploy_config.json
+
+# 2. 确认各机器 SSH 免密登录
+ssh root@10.0.0.1 echo ok
+ssh root@10.0.0.2 echo ok
+ssh root@10.0.0.3 echo ok
+
+# 3. 部署 + 启动（自动同步代码、安装依赖、启动全部节点）
+python3 deploy.py up --config deploy_config.json
+
+# 启动后控制机实时显示各节点日志，Ctrl+C 退出日志流（节点继续运行）
+```
+
+### 配置文件
+
+```jsonc
+{
+  "token_secret": "bishe-dev-secret",   // control 和 gateway 必须一致
+  "ssh_user": "root",                   // SSH 登录用户
+  "ssh_key": "~/.ssh/id_rsa",          // SSH 私钥路径（可选，默认用 ssh-agent）
+  "remote_dir": "/opt/bishe",          // 各机器上的部署目录
+  "python": "python3",                 // 远程 Python 解释器
+
+  "redis": {                           // 已有的 Redis 实例（不会自动启动）
+    "host": "10.0.0.1",
+    "port": 6379
+  },
+
+  "nodes": {                           // 四节点分配到哪些机器（可同机可不同机）
+    "control": {"host": "10.0.0.1", "port": 8009},
+    "gateway": {"host": "10.0.0.1", "port": 8010, "control_port": 8011},
+    "server":  {"host": "10.0.0.2", "port": 8002},
+    "client":  {"host": "10.0.0.3", "port": 8000, "socks_port": 0}
+  },
+
+  "mode": "inject",                    // "inject" = 隐匿注入 / "socks5" = SOCKS5 代理
+  "session": "bishe-1",
+  "queue": "bishe:overlay:queue",
+  "queue_rev": "bishe:overlay:queue:rev",
+  "reliability": true
+}
+```
+
+### 全部子命令
+
+| 命令 | 作用 |
+|------|------|
+| `python3 deploy.py up` | 同步代码 → 安装依赖 → 启动四节点 → 实时日志 |
+| `python3 deploy.py down` | 停止全部节点 |
+| `python3 deploy.py sync` | 仅同步代码，不重启（改代码后快速更新） |
+| `python3 deploy.py status` | 检查各节点 /health 状态 |
+
+### 脚本做了什么
+
+`up` 命令的执行流程：
+
+1. **解析配置** — 读取 JSON，自动推导各节点 URL
+2. **同步代码** — 按 host 去重，并行 rsync 项目文件 + pip install 依赖
+3. **按序启动** — control → gateway → server → client，每步先杀旧进程再 nohup 启动，写 PID 文件
+4. **健康检查** — 每节点启动后 curl `/health` 确认存活
+5. **日志流** — `ssh ... tail -F` 拉取四节点日志到控制机，带颜色前缀区分，Ctrl+C 退出
+
+### 注意事项
+
+- **Redis 不自动管理**：配置中的 Redis 地址需提前启动好，脚本不会帮你起 Redis
+- **`token_secret` 要一致**：control 用它签发 Token，gateway 用它验签
+- **`0.0.0.0` 监听**：脚本自动用 `--host 0.0.0.0`，确保远程可访问；注意防火墙
+- **`deploy_config.json` 已加入 `.gitignore`**：防止密钥泄露
+
+---
+
 ## 模式 1：隐匿数据注入
 
 ### 启动（5 个终端）

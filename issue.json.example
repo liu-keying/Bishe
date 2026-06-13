@@ -1,0 +1,10 @@
+{
+  "role": "client",
+  "client_url": "http://127.0.0.1:8000",
+  "server_url": "http://127.0.0.1:8002",
+  "a_url": "http://127.0.0.1:8000",
+  "c_url": "http://127.0.0.1:8002",
+  "extract_method": "psk_hmac_inplace",
+  "ttl_s": 600,
+  "pubkey": ""
+}

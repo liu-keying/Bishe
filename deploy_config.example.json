@@ -1,0 +1,36 @@
+{
+  "token_secret": "bishe-dev-secret",
+  "ssh_user": "root",
+  "ssh_key": "~/.ssh/id_rsa",
+  "remote_dir": "/opt/bishe",
+  "python": "python3",
+  "redis": {
+    "host": "10.0.0.1",
+    "port": 6379
+  },
+  "nodes": {
+    "control": {
+      "host": "10.0.0.1",
+      "port": 8009
+    },
+    "gateway": {
+      "host": "10.0.0.1",
+      "port": 8010,
+      "control_port": 8011
+    },
+    "server": {
+      "host": "10.0.0.2",
+      "port": 8002
+    },
+    "client": {
+      "host": "10.0.0.3",
+      "port": 8000,
+      "socks_port": 51081
+    }
+  },
+  "mode": "inject",
+  "session": "bishe-1",
+  "queue": "bishe:overlay:queue",
+  "queue_rev": "bishe:overlay:queue:rev",
+  "reliability": true
+}

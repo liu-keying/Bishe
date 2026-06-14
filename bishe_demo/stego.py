@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import random
+import struct
 
 # --- 旧方案：尾部 MAGIC + u32(len) + payload（便于调试）---
 STEGO_MAGIC = b"BISHE\x01"
@@ -18,6 +20,127 @@ TS_PACKET_SIZE = 188
 
 # 动态标记截断长度 t（字节）
 STEGO_TAG_LEN = 16
+
+
+def _ts_packet_header(pid: int, pusi: bool = False, has_adaptation: bool = False,
+                      has_payload: bool = True, cc: int = 0) -> bytes:
+    """构造 4 字节 TS 包头。"""
+    header = 0x47 << 24  # sync byte
+    if pusi:
+        header |= 1 << 17  # payload unit start indicator
+    header |= (pid & 0x1FFF) << 8
+    # adaptation field control: 1=payload only, 2=adaptation only, 3=both
+    afc = 1  # default: payload only
+    if has_adaptation and has_payload:
+        afc = 3
+    elif has_adaptation:
+        afc = 2
+    header |= afc << 4
+    header |= (cc & 0xF)
+    return struct.pack(">I", header)
+
+
+def _pat_packet(program_num: int, pmt_pid: int, cc: int = 0) -> bytes:
+    """生成一个 PAT 包（PID 0x0000）。"""
+    header = _ts_packet_header(pid=0, pusi=True, cc=cc)
+    # pointer_field
+    payload = b"\x00"
+    # PAT table: table_id=0x00, section_syntax_indicator=1
+    section = struct.pack(">BBHHB", 0x00, 0xB0, 0x0D, program_num, 0x00)
+    section += struct.pack(">HHH", program_num, 0xE000 | pmt_pid, 0)
+    # CRC32 placeholder (无所谓，这里用随机)
+    section += os.urandom(4)
+    # 补齐到 184 字节 payload
+    payload += section + os.urandom(184 - 1 - len(section))
+    return header + payload
+
+
+def _pmt_packet(pmt_pid: int, pcr_pid: int, video_pids: list[int],
+                cc: int = 0) -> bytes:
+    """生成一个 PMT 包。"""
+    header = _ts_packet_header(pid=pmt_pid, pusi=True, cc=cc)
+    payload = b"\x00"  # pointer_field
+    # PMT table header
+    section = struct.pack(">BBH", 0x02, 0xB0, 0x00)  # section_length placeholder
+    section += struct.pack(">HHB", 1, 0xE000 | pcr_pid, 0)
+    # stream descriptors
+    for vpid in video_pids:
+        section += struct.pack(">BHH", 0x1B, 0xE000 | vpid, 0)
+    section = section[:3] + struct.pack(">H", len(section) - 3) + section[5:]
+    # CRC32 placeholder
+    section += os.urandom(4)
+    payload += section + os.urandom(184 - 1 - len(section))
+    return header + payload
+
+
+def _pes_packet(pid: int, pusi: bool = False, cc: int = 0) -> bytes:
+    """生成一个视频 PES 包（随机负载）。"""
+    header = _ts_packet_header(pid=pid, pusi=pusi, cc=cc)
+    payload = os.urandom(184)
+    if pusi:
+        buf = bytearray(184)
+        # PES start code + stream_id (video=0xE0)
+        buf[0:4] = (0x00, 0x00, 0x01, 0xE0)
+        # PES packet length (0 表示 unbounded)
+        buf[4:6] = (0x00, 0x00)
+        # PES header flags: '10'=PTS+DTS present, '10'=PTS only
+        has_dts = random.choice([True, False])
+        buf[6] = 0x80 | (0x40 if has_dts else 0x80)  # PTS + optional DTS
+        # PES header data length
+        buf[7] = 10 if has_dts else 5
+        # PTS (33-bit, 5 bytes)
+        pts = random.randint(0, 0x1FFFFFFFF)
+        buf[8] = (0x20 if has_dts else 0x30) | ((pts >> 29) & 0x0E) | 0x01
+        buf[9] = (pts >> 22) & 0xFF
+        buf[10] = ((pts >> 14) & 0xFE) | 0x01
+        buf[11] = (pts >> 7) & 0xFF
+        buf[12] = ((pts << 1) & 0xFE) | 0x01
+        if has_dts:
+            dts = max(0, pts - random.randint(1000, 30000))
+            buf[13] = (0x10 | ((dts >> 29) & 0x0E) | 0x01)
+            buf[14] = (dts >> 22) & 0xFF
+            buf[15] = ((dts >> 14) & 0xFE) | 0x01
+            buf[16] = (dts >> 7) & 0xFF
+            buf[17] = ((dts << 1) & 0xFE) | 0x01
+            buf[18:] = os.urandom(184 - 18)
+        else:
+            buf[13:] = os.urandom(184 - 13)
+        payload = bytes(buf)
+    return header + payload
+
+
+def fake_ts_segment(size: int) -> bytes:
+    """生成伪装 TS 分片，外观为合法的 MPEG-TS 流。
+
+    包含 PAT(pid 0) → PMT → 多个视频 PES 包(随机 PID)，每个包 188 字节
+    以 0x47 同步头对齐。用于 SOCKS5 模式下替代真实 TS 文件。
+    """
+    if size < TS_PACKET_SIZE:
+        return os.urandom(size)
+    num_pkts = (size + TS_PACKET_SIZE - 1) // TS_PACKET_SIZE  # 向上取整
+    pkts: list[bytes] = []
+    pmt_pid = random.randint(0x20, 0x3F)
+    pcr_pid = random.randint(0x40, 0x5F)
+    video_pids = [random.randint(0x100, 0x1FF) for _ in range(random.randint(1, 3))]
+    cc_counters: dict[int, int] = {}
+
+    for i in range(num_pkts):
+        if i == 0:
+            pkts.append(_pat_packet(program_num=1, pmt_pid=pmt_pid, cc=_next_cc(cc_counters, 0)))
+        elif i == 1:
+            pkts.append(_pmt_packet(pmt_pid=pmt_pid, pcr_pid=pcr_pid,
+                                     video_pids=video_pids, cc=_next_cc(cc_counters, pmt_pid)))
+        else:
+            pid = random.choice(video_pids)
+            pusi = (i == 2)  # 第一个视频包带 PES header
+            pkts.append(_pes_packet(pid=pid, pusi=pusi, cc=_next_cc(cc_counters, pid)))
+    return b"".join(pkts)
+
+
+def _next_cc(counters: dict[int, int], pid: int) -> int:
+    c = counters.get(pid, random.randint(0, 15))
+    counters[pid] = (c + 1) & 0xF
+    return c
 
 
 def embed_trailer(video: bytes, hidden: bytes) -> bytes:

@@ -162,7 +162,7 @@ async def run_hls_puller(
                         logging.warning("master.m3u8 中未解析到媒体列表")
                         await asyncio.sleep(cfg.poll_interval_s)
                         continue
-                    logging.info("已解析媒体列表 URL: %s", media_playlist_url)
+                    logging.debug("已解析媒体列表 URL: %s", media_playlist_url)
 
                 try:
                     ri = await client.get(media_playlist_url)
@@ -180,7 +180,7 @@ async def run_hls_puller(
                     await asyncio.sleep(cfg.poll_interval_s)
                     continue
 
-                logging.info("index.m3u8 解析到 %d 个分片 URI，将顺序 GET", len(seg_urls))
+                logging.debug("index.m3u8 解析到 %d 个分片 URI，将顺序 GET", len(seg_urls))
                 saw_next_session = False
                 for seg_i, seg_url in enumerate(seg_urls):
                     if cfg.segment_interval_s > 0 and seg_i > 0:
@@ -207,7 +207,7 @@ async def run_hls_puller(
                         await redis.rpush(cfg.queue_key, env.to_json_bytes())
                         env_seq = int(rs.headers.get("X-Seq") or "0")
                         hdr_sess = (rs.headers.get("X-Session") or "").strip() or live_session[0]
-                        logging.info(
+                        logging.debug(
                             "HLS 拉片并入队 session=%s X-Seq=%d kind=%s",
                             hdr_sess,
                             env_seq,

@@ -28,8 +28,8 @@ class StegoWorkerConfig:
     blpop_timeout_s: int = 5
     psk: bytes | None = None
     link_token: str = ""
-    control_host: str = "127.0.0.1"
-    control_port: int = 8011
+    control_host: str | None = None
+    control_port: int | None = None  # None=不启动控制面（由 gateway 统一管理）
     reliability: ReliabilityConfig | None = None
     recv_endpoint: str = "/recv"
     direction_label: str = "fwd"
@@ -109,7 +109,7 @@ async def forward_one(
                 raise RuntimeError("中间 HLS 分片不应使用字节分块（chunk_total>1）")
             # 兼容提示：历史上可能只有最后一片含隐匿；当前实现下中间分片也可能携带密文分片（取决于 client 的 embed 策略）
             if not cipher_group and cipher_k <= 1:
-                logging.info(
+                logging.debug(
                     "HLS 纯媒体分片（无隐匿）已跳过 session=%s seq=%s hls=%d/%d",
                     env.session_id,
                     env.seq,
@@ -485,8 +485,8 @@ async def run_stego_worker(
     server_base_url: str,
     psk: bytes | None = None,
     link_token: str = "",
-    control_host: str = "127.0.0.1",
-    control_port: int = 8011,
+    control_host: str | None = None,
+    control_port: int | None = None,
     reliability: ReliabilityConfig | None = None,
     recv_endpoint: str = "/recv",
     direction_label: str = "fwd",
@@ -499,8 +499,8 @@ async def run_stego_worker(
         server_base_url=server_base_url,
         psk=psk,
         link_token=link_token or "",
-        control_host=control_host,
-        control_port=control_port,
+        control_host=control_host or "",
+        control_port=control_port or 0,
         reliability=rcfg,
         recv_endpoint=recv_endpoint.rstrip("/") or "/recv",
         direction_label=direction_label or "fwd",
@@ -521,7 +521,7 @@ async def run_stego_worker(
     async with httpx.AsyncClient(timeout=120.0, verify=False, trust_env=False) as client:
         control_runner = None
         watchdog_task = None
-        if rcfg.enabled:
+        if rcfg.enabled and control_host and control_port:
             control_runner = await run_control_server(
                 host=control_host,
                 port=control_port,
@@ -558,7 +558,7 @@ async def run_stego_worker(
                     meta2 = env2.meta or {}
                     phase2 = str(meta2.get("overlay_phase") or "").strip()
                     if phase2 == "control":
-                        logging.info("控制帧已处理 session=%s seq=%d", env2.session_id, env2.seq)
+                        logging.debug("控制帧已处理 session=%s seq=%d", env2.session_id, env2.seq)
                     else:
                         n = len(env2.unpack_payload())
                         if phase2 == "media":
@@ -578,7 +578,7 @@ async def run_stego_worker(
                                     n,
                                 )
                         elif forwarded:
-                            logging.info("转发成功 session=%s seq=%d bytes=%d", env2.session_id, env2.seq, n)
+                            logging.debug("转发成功 session=%s seq=%d bytes=%d", env2.session_id, env2.seq, n)
                 except Exception as e:
                     logging.exception("转发失败（丢弃该条）: %r", e)
                     await asyncio.sleep(0.1)

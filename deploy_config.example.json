@@ -1,9 +1,9 @@
 {
-  "token_secret": "bishe-dev-secret",
+  "token_secret": "",
   "ssh_user": "root",
   "ssh_key": "~/.ssh/id_rsa",
-  "remote_dir": "/opt/bishe",
-  "python": "python3",
+  "ssh_password": null,
+  "remote_dir": "bishe",
   "redis": {
     "host": "10.0.0.1",
     "port": 6379
@@ -20,12 +20,16 @@
     },
     "server": {
       "host": "10.0.0.2",
-      "port": 8002
+      "port": 8002,
+      "ssh_user": "admin",
+      "ssh_password": "server-pass-123"
     },
     "client": {
       "host": "10.0.0.3",
       "port": 8000,
-      "socks_port": 51081
+      "socks_port": 0,
+      "ssh_user": "ubuntu",
+      "ssh_key": "~/.ssh/client_key"
     }
   },
   "mode": "inject",

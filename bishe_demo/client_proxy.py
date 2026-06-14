@@ -23,6 +23,7 @@ from .stego import (
     STEGO_TAG_LEN,
     embed_pad_inplace,
     embed_psk_inplace,
+    fake_ts_segment,
 )
 from .tunnel import CTL_CONNECT, CTL_CONNECTED, CTL_ERROR, CTL_FIN, TunnelCtl, TunnelData
 
@@ -628,7 +629,7 @@ def _embed_tunnel_msg(app: web.Application, payload: bytes, *, is_ctl: bool = Fa
 
     try:
         blob = embed_psk_inplace(
-            b"\x00" * (g_bytes + STEGO_TAG_LEN),  # 占位分片，须 >= STEGO_TAG_LEN + cipher_fragment
+            fake_ts_segment(g_bytes + STEGO_TAG_LEN),  # 伪装 TS 分片
             token=link_token,
             hls_index=0,
             frag_idx=0,
@@ -842,6 +843,8 @@ async def run_client_proxy(
     socks_idle_timeout: float = 300.0,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     app = web.Application(client_max_size=256 * 1024 * 1024)
     setup_hls_state(app, session_id or "bishe-1")
@@ -853,60 +856,79 @@ async def run_client_proxy(
     control_url2 = (control_url or "").strip()
     server_url2 = (server_url or "").strip()
     if control_url2 and server_url2:
-        client_base = f"http://{host}:{port}"
-        priv, pub = generate_rsa_keypair(bits=2048)
-        pub_b64 = b64e(rsa_pub_to_pem(pub))
-        link = f"{client_base.rstrip('/')}|{server_url2.rstrip('/')}|{STEGO_METHOD_PSK_HMAC_INPLACE}"
-        aad = link.encode("utf-8")
-        async with httpx.AsyncClient(timeout=10.0, verify=False, trust_env=False) as client:
-            while True:
-                r = await client.post(
-                    f"{control_url2.rstrip('/')}/issue",
-                    json={
-                        "role": "client",
-                        "client_url": client_base,
-                        "server_url": server_url2,
-                        "a_url": client_base,
-                        "c_url": server_url2,
-                        "extract_method": STEGO_METHOD_PSK_HMAC_INPLACE,
-                        "ttl_s": 600,
-                        "pubkey": pub_b64,
-                    },
-                )
-                r.raise_for_status()
-                obj = r.json()
-                if obj.get("ok") is not True:
-                    raise SystemExit(f"control /issue failed: {obj!r}")
-                if obj.get("pending"):
-                    await asyncio.sleep(float(obj.get("retry_after_s") or 0.5))
-                    continue
-                bundle = obj.get("bundle") or {}
-                import json
-
-                ek_psk = b64d(str(bundle.get("ek_psk") or ""))
-                nonce = b64d(str(bundle.get("nonce") or ""))
-                ct = b64d(str(bundle.get("ciphertext") or ""))
-                psk = rsa_oaep_unwrap(recipient_priv=priv, wrapped=ek_psk)
-                pt = aead_decrypt(key32=psk, nonce=nonce, ciphertext=ct, aad=aad)
-                data = json.loads(pt.decode("utf-8"))
-                psk_b64 = b64e(psk)
-                token = str(data.get("token") or "")
-                if not psk_b64:
-                    raise SystemExit(f"control bundle missing psk_b64: {data!r}")
-                if not token:
-                    raise SystemExit(f"control bundle missing token: {data!r}")
-                app["psk"] = b64d(psk_b64)
-                app["link_token"] = token
-                logging.info("client 已从 control 获取 PSK（数据面加密启用）")
-                gw = (gateway_url or "").strip()
-                if gw:
-                    rr = await client.post(
-                        f"{gw.rstrip('/')}/register",
-                        json={"role": "client", "token": token, "psk_b64": b64e(psk)},
-                    )
-                    rr.raise_for_status()
-                    logging.info("client 已向 gateway 注册（role=client）")
-                break
+        async def _kex_background() -> None:
+            client_base = f"http://{host}:{port}"
+            priv, pub = generate_rsa_keypair(bits=2048)
+            pub_b64 = b64e(rsa_pub_to_pem(pub))
+            link = f"{client_base.rstrip('/')}|{server_url2.rstrip('/')}|{STEGO_METHOD_PSK_HMAC_INPLACE}"
+            aad = link.encode("utf-8")
+            async with httpx.AsyncClient(timeout=10.0, verify=False, trust_env=False) as client:
+                while True:
+                    try:
+                        r = await client.post(
+                            f"{control_url2.rstrip('/')}/issue",
+                            json={
+                                "role": "client",
+                                "client_url": client_base,
+                                "server_url": server_url2,
+                                "a_url": client_base,
+                                "c_url": server_url2,
+                                "extract_method": STEGO_METHOD_PSK_HMAC_INPLACE,
+                                "ttl_s": 600,
+                                "pubkey": pub_b64,
+                            },
+                        )
+                        r.raise_for_status()
+                    except Exception as e:
+                        logging.warning("client PSK 交换失败，10s 后重试: %r", e)
+                        await asyncio.sleep(10)
+                        continue
+                    obj = r.json()
+                    if obj.get("ok") is not True:
+                        logging.warning("control /issue 返回错误，10s 后重试: %r", obj)
+                        await asyncio.sleep(10)
+                        continue
+                    if obj.get("pending"):
+                        await asyncio.sleep(float(obj.get("retry_after_s") or 0.5))
+                        continue
+                    bundle = obj.get("bundle") or {}
+                    import json
+                    try:
+                        ek_psk = b64d(str(bundle.get("ek_psk") or ""))
+                        nonce = b64d(str(bundle.get("nonce") or ""))
+                        ct = b64d(str(bundle.get("ciphertext") or ""))
+                        psk = rsa_oaep_unwrap(recipient_priv=priv, wrapped=ek_psk)
+                        pt = aead_decrypt(key32=psk, nonce=nonce, ciphertext=ct, aad=aad)
+                        data = json.loads(pt.decode("utf-8"))
+                        psk_b64 = b64e(psk)
+                        token = str(data.get("token") or "")
+                    except Exception as e:
+                        logging.warning("client PSK 解密失败，10s 后重试: %r", e)
+                        await asyncio.sleep(10)
+                        continue
+                    if not psk_b64 or not token:
+                        logging.warning("control bundle 缺少字段，10s 后重试")
+                        await asyncio.sleep(10)
+                        continue
+                    app["psk"] = b64d(psk_b64)
+                    app["link_token"] = token
+                    logging.info("client 已从 control 获取 PSK（数据面加密启用）")
+                    gw = (gateway_url or "").strip()
+                    if gw:
+                        try:
+                            async with httpx.AsyncClient(timeout=10.0, verify=False, trust_env=False) as gw_client:
+                                rr = await gw_client.post(
+                                    f"{gw.rstrip('/')}/register",
+                                    json={"role": "client", "token": token, "psk_b64": b64e(psk)},
+                                )
+                                rr.raise_for_status()
+                                logging.info("client 已向 gateway 注册（role=client）")
+                        except Exception as e:
+                            logging.warning("client 向 gateway 注册失败，10s 后重试: %r", e)
+                            await asyncio.sleep(10)
+                            continue
+                    return  # PSK 交换成功
+        asyncio.create_task(_kex_background())
 
     app.router.add_get("/health", handle_health)
     app.router.add_post("/overlay/stop-notice", handle_stop_notice)

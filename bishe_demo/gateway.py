@@ -120,6 +120,27 @@ async def handle_register(request: web.Request) -> web.Response:
                 await asyncio.sleep(5)
                 # 不重新抛出，让 task 自然结束（外部无法重启）
 
+        # 启动共享的可靠性控制面（只启动一次，供两个 worker 共用）
+        async def _start_control_server():
+            from .reliability import run_control_server as start_ctrl, ReliabilityConfig
+            import httpx
+            from redis.asyncio import Redis
+            rcfg = cfg.reliability
+            if not rcfg.enabled:
+                return None
+            r = Redis.from_url(cfg.redis_url, decode_responses=False)
+            await r.ping()
+            client = httpx.AsyncClient(timeout=120.0, verify=False, trust_env=False)
+            runner = await start_ctrl(
+                host=cfg.control_host, port=cfg.control_port,
+                redis=r, http_client=client, rcfg=rcfg)
+            request.app["_control_runner"] = runner
+            request.app["_control_redis"] = r
+            request.app["_control_client"] = client
+            return runner
+
+        request.app["_control_task"] = asyncio.create_task(_start_control_server())
+
         request.app["pull_task"] = asyncio.create_task(
             _safe_task("pull_fwd", run_hls_puller(
                 source_base_url=client_url,
@@ -138,8 +159,6 @@ async def handle_register(request: web.Request) -> web.Response:
                 server_base_url=server_url,
                 psk=psk_val,
                 link_token=token_val,
-                control_host=cfg.control_host,
-                control_port=cfg.control_port,
                 reliability=cfg.reliability,
                 recv_endpoint="/recv",
                 direction_label="fwd",
@@ -170,8 +189,6 @@ async def handle_register(request: web.Request) -> web.Response:
                 server_base_url=client_url,  # 转发到 client
                 psk=psk_val,
                 link_token=token_val,
-                control_host=cfg.control_host,
-                control_port=cfg.control_port,
                 reliability=cfg.reliability,
                 recv_endpoint="/overlay/recv-tunnel",
                 direction_label="rev",
@@ -254,6 +271,8 @@ async def run_gateway(
     queue_key_rev: str = "bishe:overlay:queue:rev",
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     cport = int(control_port) if control_port is not None else int(port) + 1
     rcfg = reliability if reliability is not None else ReliabilityConfig()
     cfg = GatewayConfig(
